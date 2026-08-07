@@ -1,0 +1,7 @@
+# Mere backend build artifacts
+*.wat
+*.wasm
+*.ll
+*.c
+*.out
+a.out

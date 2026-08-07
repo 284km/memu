@@ -1,0 +1,28 @@
+// common.mere — shared primitives for the memu CPU emulators.
+//
+// Every emulator here is an 8-/16-/32-bit machine backed by a flat, mutable
+// Vec[int] "memory" and a small Vec[int] register file, so they lean on the
+// same handful of helpers: fixed-width masks, a zero-filled vector builder,
+// and a routine to blit a `bytes` ROM into memory. Keeping them in one module
+// lets each emulator start with `import "common.mere";` and stay focused on
+// its own decode/execute logic.
+
+let mask8  = fn x -> bit_and x 255;          // 0xFF
+let mask12 = fn x -> bit_and x 4095;         // 0xFFF   (CHIP-8 addresses)
+let mask16 = fn x -> bit_and x 65535;        // 0xFFFF  (6502 / Game Boy addresses)
+let mask32 = fn x -> bit_and x 4294967295;   // 0xFFFFFFFF (RV32I words)
+
+let hi8 = fn x -> bit_and (bit_shr x 8) 255; // high byte of a 16-bit value
+let lo8 = fn x -> bit_and x 255;             // low byte
+
+// a Vec of length n, every slot initialized to x
+let new_vec = fn n -> fn x ->
+  let v = vec_new () in
+  let rec go = fn i -> if i >= n then () else let _ = vec_push v x in go (i + 1) in
+  let _ = go 0 in v;
+
+// copy a `bytes` value into memory starting at address `at`
+let blit_bytes = fn mem -> fn at -> fn b ->
+  let n = bytes_len b in
+  let rec go = fn i -> if i >= n then () else let _ = vec_set mem (at + i) (bytes_get b i) in go (i + 1) in
+  go 0;
