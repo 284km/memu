@@ -1,0 +1,372 @@
+// klaus_test.mere — the complete MOS 6502 core, validated against Klaus
+// Dormann's 6502_functional_test — the gold-standard 6502 conformance test.
+//
+// Unlike the compact ../mos6502.mere teaching rung, this implements the full
+// official instruction set: every opcode and addressing mode, read-modify-write
+// (ASL/LSR/ROL/ROR on memory), BIT, the packed P status register (PHP/PLP/RTI),
+// BRK through the IRQ vector, the JMP-indirect page-wrap bug, and decimal (BCD)
+// mode for ADC/SBC with the NMOS flag behaviour. It loads the test's 64 KB
+// memory image, sets PC=$0400, and runs until the program counter self-loops:
+// reaching $3469 (`JMP *`) means every test passed; any other trap address is
+// the failing test. Passes on the interpreter, C, and LLVM backends.
+//
+// The ROM is GPL-licensed and not redistributed here — fetch it first:
+//   curl -L -o 6502_functional_test.bin \
+//     https://raw.githubusercontent.com/Klaus2m5/6502_65C02_functional_tests/master/bin_files/6502_functional_test.bin
+// then run from this directory:
+//   mere klaus_test.mere        # interpreter (slow; ~tens of millions of ops)
+//   mere -c klaus_test.mere > k.c && clang -O2 k.c -o k && ./k   # fast
+
+let mask8  = fn x -> bit_and x 255;
+let mask16 = fn x -> bit_and x 65535;
+let new_vec = fn n -> fn x ->
+  let v = vec_new () in
+  let rec go = fn i -> if i >= n then () else let _ = vec_push v x in go (i + 1) in
+  let _ = go 0 in v;
+
+// reg: [A X Y SP PC  C Z N V I D  HALT]  (PC 16-bit, flags 0/1 slots)
+let rA = 0; let rX = 1; let rY = 2; let rSP = 3; let rPC = 4;
+let fC = 5; let fZ = 6; let fN = 7; let fV = 8; let fI = 9; let fD = 10;
+let rHALT = 11;
+
+let rd = fn mem -> fn a -> vec_get mem (mask16 a);
+let wr = fn mem -> fn a -> fn v -> vec_set mem (mask16 a) (mask8 v);
+
+let fetch = fn mem -> fn reg ->
+  let pc = vec_get reg rPC in let b = vec_get mem pc in
+  let _ = vec_set reg rPC (mask16 (pc + 1)) in b;
+let fetch16 = fn mem -> fn reg -> let lo = fetch mem reg in let hi = fetch mem reg in lo + hi * 256;
+
+let set_zn = fn reg -> fn v ->
+  let _ = vec_set reg fZ (if v == 0 then 1 else 0) in
+  vec_set reg fN (if bit_and v 128 == 0 then 0 else 1);
+
+let push = fn mem -> fn reg -> fn v ->
+  let sp = vec_get reg rSP in
+  let _ = vec_set mem (256 + sp) (mask8 v) in vec_set reg rSP (mask8 (sp - 1));
+let pull = fn mem -> fn reg ->
+  let sp = mask8 (vec_get reg rSP + 1) in let _ = vec_set reg rSP sp in vec_get mem (256 + sp);
+
+// pack/unpack the P status byte: N V 1 B D I Z C
+let pack_p = fn reg -> fn b ->
+  bit_or (bit_shl (vec_get reg fN) 7) (bit_or (bit_shl (vec_get reg fV) 6)
+  (bit_or 32 (bit_or (bit_shl b 4) (bit_or (bit_shl (vec_get reg fD) 3)
+  (bit_or (bit_shl (vec_get reg fI) 2) (bit_or (bit_shl (vec_get reg fZ) 1) (vec_get reg fC)))))));
+let unpack_p = fn reg -> fn p ->
+  let _ = vec_set reg fN (bit_and (bit_shr p 7) 1) in
+  let _ = vec_set reg fV (bit_and (bit_shr p 6) 1) in
+  let _ = vec_set reg fD (bit_and (bit_shr p 3) 1) in
+  let _ = vec_set reg fI (bit_and (bit_shr p 2) 1) in
+  let _ = vec_set reg fZ (bit_and (bit_shr p 1) 1) in
+  vec_set reg fC (bit_and p 1);
+
+// addressing modes -> effective address
+let am_zp   = fn mem -> fn reg -> fetch mem reg;
+let am_zpx  = fn mem -> fn reg -> mask8 (fetch mem reg + vec_get reg rX);
+let am_zpy  = fn mem -> fn reg -> mask8 (fetch mem reg + vec_get reg rY);
+let am_abs  = fn mem -> fn reg -> fetch16 mem reg;
+let am_absx = fn mem -> fn reg -> mask16 (fetch16 mem reg + vec_get reg rX);
+let am_absy = fn mem -> fn reg -> mask16 (fetch16 mem reg + vec_get reg rY);
+let am_indx = fn mem -> fn reg ->
+  let zp = mask8 (fetch mem reg + vec_get reg rX) in
+  vec_get mem zp + vec_get mem (mask8 (zp + 1)) * 256;
+let am_indy = fn mem -> fn reg ->
+  let zp = fetch mem reg in
+  mask16 (vec_get mem zp + vec_get mem (mask8 (zp + 1)) * 256 + vec_get reg rY);
+
+// ALU
+let adc = fn reg -> fn m ->
+  let a = vec_get reg rA in
+  let c = vec_get reg fC in
+  if vec_get reg fD == 0 then
+    // binary
+    let sum = a + m + c in
+    let res = mask8 sum in
+    let _ = vec_set reg fC (if sum > 255 then 1 else 0) in
+    let ov = bit_and (bit_and (bit_xor a res) (bit_xor m res)) 128 in
+    let _ = vec_set reg fV (if ov == 0 then 0 else 1) in
+    let _ = vec_set reg rA res in set_zn reg res
+  else
+    // decimal (NMOS): Z from binary sum, N/V from the pre-adjust intermediate
+    let al0 = bit_and a 15 + bit_and m 15 + c in
+    let al = if al0 >= 10 then bit_and (al0 + 6) 15 + 16 else al0 in
+    let aint = bit_and a 240 + bit_and m 240 + al in
+    let _ = vec_set reg fN (if bit_and aint 128 == 0 then 0 else 1) in
+    let ov = bit_and (bit_and (bit_xor a aint) (bit_xor m aint)) 128 in
+    let _ = vec_set reg fV (if ov == 0 then 0 else 1) in
+    let _ = vec_set reg fZ (if bit_and (a + m + c) 255 == 0 then 1 else 0) in
+    let ah = if aint >= 160 then aint + 96 else aint in
+    let _ = vec_set reg fC (if ah >= 256 then 1 else 0) in
+    vec_set reg rA (bit_and ah 255);
+let sbc = fn reg -> fn m ->
+  if vec_get reg fD == 0 then adc reg (bit_xor m 255)
+  else
+    // decimal SBC: flags computed as in binary mode, only A differs (NMOS)
+    let a = vec_get reg rA in
+    let c = vec_get reg fC in
+    let bin = a - m - (1 - c) in
+    let binres = bit_and bin 255 in
+    let _ = vec_set reg fC (if bin >= 0 then 1 else 0) in
+    let _ = vec_set reg fZ (if binres == 0 then 1 else 0) in
+    let _ = vec_set reg fN (if bit_and binres 128 == 0 then 0 else 1) in
+    let ov = bit_and (bit_and (bit_xor a binres) (bit_xor (bit_xor m 255) binres)) 128 in
+    let _ = vec_set reg fV (if ov == 0 then 0 else 1) in
+    let al0 = bit_and a 15 - bit_and m 15 + c - 1 in
+    let al = if al0 < 0 then bit_and (al0 - 6) 15 - 16 else al0 in
+    let aint = bit_and a 240 - bit_and m 240 + al in
+    let aint2 = if aint < 0 then aint - 96 else aint in
+    vec_set reg rA (bit_and aint2 255);
+let compare = fn reg -> fn rv -> fn m ->
+  let t = mask8 (rv - m) in
+  let _ = vec_set reg fC (if rv >= m then 1 else 0) in set_zn reg t;
+let ora = fn reg -> fn m -> let r = bit_or (vec_get reg rA) m in let _ = vec_set reg rA r in set_zn reg r;
+let anda = fn reg -> fn m -> let r = bit_and (vec_get reg rA) m in let _ = vec_set reg rA r in set_zn reg r;
+let eora = fn reg -> fn m -> let r = bit_xor (vec_get reg rA) m in let _ = vec_set reg rA r in set_zn reg r;
+let bit_test = fn reg -> fn m ->
+  let _ = vec_set reg fZ (if bit_and (vec_get reg rA) m == 0 then 1 else 0) in
+  let _ = vec_set reg fN (bit_and (bit_shr m 7) 1) in
+  vec_set reg fV (bit_and (bit_shr m 6) 1);
+
+// shift/rotate on a value (returns new value, sets C + Z/N)
+let asl = fn reg -> fn v ->
+  let _ = vec_set reg fC (if bit_and v 128 == 0 then 0 else 1) in
+  let r = mask8 (bit_shl v 1) in let _ = set_zn reg r in r;
+let lsr = fn reg -> fn v ->
+  let _ = vec_set reg fC (bit_and v 1) in
+  let r = bit_shr v 1 in let _ = set_zn reg r in r;
+let rol = fn reg -> fn v ->
+  let c = vec_get reg fC in
+  let _ = vec_set reg fC (if bit_and v 128 == 0 then 0 else 1) in
+  let r = mask8 (bit_or (bit_shl v 1) c) in let _ = set_zn reg r in r;
+let ror = fn reg -> fn v ->
+  let c = vec_get reg fC in
+  let _ = vec_set reg fC (bit_and v 1) in
+  let r = mask8 (bit_or (bit_shr v 1) (bit_shl c 7)) in let _ = set_zn reg r in r;
+// read-modify-write memory at addr through op f
+let rmw = fn mem -> fn reg -> fn addr -> fn f -> vec_set mem addr (f reg (vec_get mem addr));
+
+let load = fn reg -> fn slot -> fn v -> let _ = vec_set reg slot (mask8 v) in set_zn reg (mask8 v);
+let branch = fn mem -> fn reg -> fn cnd ->
+  let rel = fetch mem reg in
+  if cnd == 1 then
+    let off = if rel >= 128 then rel - 256 else rel in
+    vec_set reg rPC (mask16 (vec_get reg rPC + off))
+  else ();
+
+let step = fn mem -> fn reg ->
+  let op = fetch mem reg in
+  // ---- loads ----
+  if op == 0xA9 then load reg rA (fetch mem reg)
+  else if op == 0xA5 then load reg rA (rd mem (am_zp mem reg))
+  else if op == 0xB5 then load reg rA (rd mem (am_zpx mem reg))
+  else if op == 0xAD then load reg rA (rd mem (am_abs mem reg))
+  else if op == 0xBD then load reg rA (rd mem (am_absx mem reg))
+  else if op == 0xB9 then load reg rA (rd mem (am_absy mem reg))
+  else if op == 0xA1 then load reg rA (rd mem (am_indx mem reg))
+  else if op == 0xB1 then load reg rA (rd mem (am_indy mem reg))
+  else if op == 0xA2 then load reg rX (fetch mem reg)
+  else if op == 0xA6 then load reg rX (rd mem (am_zp mem reg))
+  else if op == 0xB6 then load reg rX (rd mem (am_zpy mem reg))
+  else if op == 0xAE then load reg rX (rd mem (am_abs mem reg))
+  else if op == 0xBE then load reg rX (rd mem (am_absy mem reg))
+  else if op == 0xA0 then load reg rY (fetch mem reg)
+  else if op == 0xA4 then load reg rY (rd mem (am_zp mem reg))
+  else if op == 0xB4 then load reg rY (rd mem (am_zpx mem reg))
+  else if op == 0xAC then load reg rY (rd mem (am_abs mem reg))
+  else if op == 0xBC then load reg rY (rd mem (am_absx mem reg))
+  // ---- stores ----
+  else if op == 0x85 then wr mem (am_zp mem reg) (vec_get reg rA)
+  else if op == 0x95 then wr mem (am_zpx mem reg) (vec_get reg rA)
+  else if op == 0x8D then wr mem (am_abs mem reg) (vec_get reg rA)
+  else if op == 0x9D then wr mem (am_absx mem reg) (vec_get reg rA)
+  else if op == 0x99 then wr mem (am_absy mem reg) (vec_get reg rA)
+  else if op == 0x81 then wr mem (am_indx mem reg) (vec_get reg rA)
+  else if op == 0x91 then wr mem (am_indy mem reg) (vec_get reg rA)
+  else if op == 0x86 then wr mem (am_zp mem reg) (vec_get reg rX)
+  else if op == 0x96 then wr mem (am_zpy mem reg) (vec_get reg rX)
+  else if op == 0x8E then wr mem (am_abs mem reg) (vec_get reg rX)
+  else if op == 0x84 then wr mem (am_zp mem reg) (vec_get reg rY)
+  else if op == 0x94 then wr mem (am_zpx mem reg) (vec_get reg rY)
+  else if op == 0x8C then wr mem (am_abs mem reg) (vec_get reg rY)
+  // ---- transfers ----
+  else if op == 0xAA then load reg rX (vec_get reg rA)               // TAX
+  else if op == 0xA8 then load reg rY (vec_get reg rA)               // TAY
+  else if op == 0x8A then load reg rA (vec_get reg rX)               // TXA
+  else if op == 0x98 then load reg rA (vec_get reg rY)               // TYA
+  else if op == 0xBA then load reg rX (vec_get reg rSP)             // TSX
+  else if op == 0x9A then vec_set reg rSP (vec_get reg rX)          // TXS
+  // ---- ADC ----
+  else if op == 0x69 then adc reg (fetch mem reg)
+  else if op == 0x65 then adc reg (rd mem (am_zp mem reg))
+  else if op == 0x75 then adc reg (rd mem (am_zpx mem reg))
+  else if op == 0x6D then adc reg (rd mem (am_abs mem reg))
+  else if op == 0x7D then adc reg (rd mem (am_absx mem reg))
+  else if op == 0x79 then adc reg (rd mem (am_absy mem reg))
+  else if op == 0x61 then adc reg (rd mem (am_indx mem reg))
+  else if op == 0x71 then adc reg (rd mem (am_indy mem reg))
+  // ---- SBC ----
+  else if op == 0xE9 then sbc reg (fetch mem reg)
+  else if op == 0xE5 then sbc reg (rd mem (am_zp mem reg))
+  else if op == 0xF5 then sbc reg (rd mem (am_zpx mem reg))
+  else if op == 0xED then sbc reg (rd mem (am_abs mem reg))
+  else if op == 0xFD then sbc reg (rd mem (am_absx mem reg))
+  else if op == 0xF9 then sbc reg (rd mem (am_absy mem reg))
+  else if op == 0xE1 then sbc reg (rd mem (am_indx mem reg))
+  else if op == 0xF1 then sbc reg (rd mem (am_indy mem reg))
+  // ---- AND ----
+  else if op == 0x29 then anda reg (fetch mem reg)
+  else if op == 0x25 then anda reg (rd mem (am_zp mem reg))
+  else if op == 0x35 then anda reg (rd mem (am_zpx mem reg))
+  else if op == 0x2D then anda reg (rd mem (am_abs mem reg))
+  else if op == 0x3D then anda reg (rd mem (am_absx mem reg))
+  else if op == 0x39 then anda reg (rd mem (am_absy mem reg))
+  else if op == 0x21 then anda reg (rd mem (am_indx mem reg))
+  else if op == 0x31 then anda reg (rd mem (am_indy mem reg))
+  // ---- ORA ----
+  else if op == 0x09 then ora reg (fetch mem reg)
+  else if op == 0x05 then ora reg (rd mem (am_zp mem reg))
+  else if op == 0x15 then ora reg (rd mem (am_zpx mem reg))
+  else if op == 0x0D then ora reg (rd mem (am_abs mem reg))
+  else if op == 0x1D then ora reg (rd mem (am_absx mem reg))
+  else if op == 0x19 then ora reg (rd mem (am_absy mem reg))
+  else if op == 0x01 then ora reg (rd mem (am_indx mem reg))
+  else if op == 0x11 then ora reg (rd mem (am_indy mem reg))
+  // ---- EOR ----
+  else if op == 0x49 then eora reg (fetch mem reg)
+  else if op == 0x45 then eora reg (rd mem (am_zp mem reg))
+  else if op == 0x55 then eora reg (rd mem (am_zpx mem reg))
+  else if op == 0x4D then eora reg (rd mem (am_abs mem reg))
+  else if op == 0x5D then eora reg (rd mem (am_absx mem reg))
+  else if op == 0x59 then eora reg (rd mem (am_absy mem reg))
+  else if op == 0x41 then eora reg (rd mem (am_indx mem reg))
+  else if op == 0x51 then eora reg (rd mem (am_indy mem reg))
+  // ---- CMP ----
+  else if op == 0xC9 then compare reg (vec_get reg rA) (fetch mem reg)
+  else if op == 0xC5 then compare reg (vec_get reg rA) (rd mem (am_zp mem reg))
+  else if op == 0xD5 then compare reg (vec_get reg rA) (rd mem (am_zpx mem reg))
+  else if op == 0xCD then compare reg (vec_get reg rA) (rd mem (am_abs mem reg))
+  else if op == 0xDD then compare reg (vec_get reg rA) (rd mem (am_absx mem reg))
+  else if op == 0xD9 then compare reg (vec_get reg rA) (rd mem (am_absy mem reg))
+  else if op == 0xC1 then compare reg (vec_get reg rA) (rd mem (am_indx mem reg))
+  else if op == 0xD1 then compare reg (vec_get reg rA) (rd mem (am_indy mem reg))
+  // ---- CPX / CPY ----
+  else if op == 0xE0 then compare reg (vec_get reg rX) (fetch mem reg)
+  else if op == 0xE4 then compare reg (vec_get reg rX) (rd mem (am_zp mem reg))
+  else if op == 0xEC then compare reg (vec_get reg rX) (rd mem (am_abs mem reg))
+  else if op == 0xC0 then compare reg (vec_get reg rY) (fetch mem reg)
+  else if op == 0xC4 then compare reg (vec_get reg rY) (rd mem (am_zp mem reg))
+  else if op == 0xCC then compare reg (vec_get reg rY) (rd mem (am_abs mem reg))
+  // ---- INC / DEC memory ----
+  else if op == 0xE6 then let a = am_zp mem reg in let _ = wr mem a (mask8 (rd mem a + 1)) in set_zn reg (rd mem a)
+  else if op == 0xF6 then let a = am_zpx mem reg in let _ = wr mem a (mask8 (rd mem a + 1)) in set_zn reg (rd mem a)
+  else if op == 0xEE then let a = am_abs mem reg in let _ = wr mem a (mask8 (rd mem a + 1)) in set_zn reg (rd mem a)
+  else if op == 0xFE then let a = am_absx mem reg in let _ = wr mem a (mask8 (rd mem a + 1)) in set_zn reg (rd mem a)
+  else if op == 0xC6 then let a = am_zp mem reg in let _ = wr mem a (mask8 (rd mem a - 1)) in set_zn reg (rd mem a)
+  else if op == 0xD6 then let a = am_zpx mem reg in let _ = wr mem a (mask8 (rd mem a - 1)) in set_zn reg (rd mem a)
+  else if op == 0xCE then let a = am_abs mem reg in let _ = wr mem a (mask8 (rd mem a - 1)) in set_zn reg (rd mem a)
+  else if op == 0xDE then let a = am_absx mem reg in let _ = wr mem a (mask8 (rd mem a - 1)) in set_zn reg (rd mem a)
+  else if op == 0xE8 then load reg rX (vec_get reg rX + 1)          // INX
+  else if op == 0xC8 then load reg rY (vec_get reg rY + 1)          // INY
+  else if op == 0xCA then load reg rX (mask8 (vec_get reg rX - 1))  // DEX
+  else if op == 0x88 then load reg rY (mask8 (vec_get reg rY - 1))  // DEY
+  // ---- ASL / LSR / ROL / ROR ----
+  else if op == 0x0A then vec_set reg rA (asl reg (vec_get reg rA))
+  else if op == 0x06 then rmw mem reg (am_zp mem reg) asl
+  else if op == 0x16 then rmw mem reg (am_zpx mem reg) asl
+  else if op == 0x0E then rmw mem reg (am_abs mem reg) asl
+  else if op == 0x1E then rmw mem reg (am_absx mem reg) asl
+  else if op == 0x4A then vec_set reg rA (lsr reg (vec_get reg rA))
+  else if op == 0x46 then rmw mem reg (am_zp mem reg) lsr
+  else if op == 0x56 then rmw mem reg (am_zpx mem reg) lsr
+  else if op == 0x4E then rmw mem reg (am_abs mem reg) lsr
+  else if op == 0x5E then rmw mem reg (am_absx mem reg) lsr
+  else if op == 0x2A then vec_set reg rA (rol reg (vec_get reg rA))
+  else if op == 0x26 then rmw mem reg (am_zp mem reg) rol
+  else if op == 0x36 then rmw mem reg (am_zpx mem reg) rol
+  else if op == 0x2E then rmw mem reg (am_abs mem reg) rol
+  else if op == 0x3E then rmw mem reg (am_absx mem reg) rol
+  else if op == 0x6A then vec_set reg rA (ror reg (vec_get reg rA))
+  else if op == 0x66 then rmw mem reg (am_zp mem reg) ror
+  else if op == 0x76 then rmw mem reg (am_zpx mem reg) ror
+  else if op == 0x6E then rmw mem reg (am_abs mem reg) ror
+  else if op == 0x7E then rmw mem reg (am_absx mem reg) ror
+  // ---- BIT ----
+  else if op == 0x24 then bit_test reg (rd mem (am_zp mem reg))
+  else if op == 0x2C then bit_test reg (rd mem (am_abs mem reg))
+  // ---- branches ----
+  else if op == 0xD0 then branch mem reg (if vec_get reg fZ == 0 then 1 else 0)   // BNE
+  else if op == 0xF0 then branch mem reg (vec_get reg fZ)                          // BEQ
+  else if op == 0x90 then branch mem reg (if vec_get reg fC == 0 then 1 else 0)   // BCC
+  else if op == 0xB0 then branch mem reg (vec_get reg fC)                          // BCS
+  else if op == 0x10 then branch mem reg (if vec_get reg fN == 0 then 1 else 0)   // BPL
+  else if op == 0x30 then branch mem reg (vec_get reg fN)                          // BMI
+  else if op == 0x50 then branch mem reg (if vec_get reg fV == 0 then 1 else 0)   // BVC
+  else if op == 0x70 then branch mem reg (vec_get reg fV)                          // BVS
+  // ---- jumps / subroutine ----
+  else if op == 0x4C then vec_set reg rPC (am_abs mem reg)                         // JMP abs
+  else if op == 0x6C then                                                          // JMP (ind) w/ page-wrap bug
+    let p = am_abs mem reg in
+    let lo = rd mem p in
+    let hi = rd mem (bit_or (bit_and p 0xFF00) (bit_and (p + 1) 0xFF)) in
+    vec_set reg rPC (lo + hi * 256)
+  else if op == 0x20 then                                                          // JSR
+    let target = fetch16 mem reg in
+    let ret = mask16 (vec_get reg rPC - 1) in
+    let _ = push mem reg (bit_and (bit_shr ret 8) 255) in
+    let _ = push mem reg (bit_and ret 255) in
+    vec_set reg rPC target
+  else if op == 0x60 then                                                          // RTS
+    let lo = pull mem reg in let hi = pull mem reg in
+    vec_set reg rPC (mask16 (lo + hi * 256 + 1))
+  // ---- stack / flags for P ----
+  else if op == 0x48 then push mem reg (vec_get reg rA)                            // PHA
+  else if op == 0x68 then load reg rA (pull mem reg)                               // PLA
+  else if op == 0x08 then push mem reg (pack_p reg 1)                              // PHP (B=1)
+  else if op == 0x28 then unpack_p reg (pull mem reg)                              // PLP
+  else if op == 0x40 then                                                          // RTI
+    let p = pull mem reg in
+    let _ = unpack_p reg p in
+    let lo = pull mem reg in let hi = pull mem reg in
+    vec_set reg rPC (lo + hi * 256)
+  else if op == 0x00 then                                                          // BRK
+    let _ = vec_set reg rPC (mask16 (vec_get reg rPC + 1)) in
+    let ret = vec_get reg rPC in
+    let _ = push mem reg (bit_and (bit_shr ret 8) 255) in
+    let _ = push mem reg (bit_and ret 255) in
+    let _ = push mem reg (pack_p reg 1) in
+    let _ = vec_set reg fI 1 in
+    vec_set reg rPC (rd mem 0xFFFE + rd mem 0xFFFF * 256)
+  // ---- flag ops ----
+  else if op == 0x18 then vec_set reg fC 0
+  else if op == 0x38 then vec_set reg fC 1
+  else if op == 0xD8 then vec_set reg fD 0
+  else if op == 0xF8 then vec_set reg fD 1
+  else if op == 0xB8 then vec_set reg fV 0
+  else if op == 0x58 then vec_set reg fI 0
+  else if op == 0x78 then vec_set reg fI 1
+  else if op == 0xEA then ()                                                       // NOP
+  else vec_set reg rHALT 1;   // unknown opcode -> halt (drive() reports -2)
+
+// --- Klaus harness --------------------------------------------------------
+let mem = new_vec 65536 0;
+let reg = new_vec 12 0;
+let rom = read_file_bytes "6502_functional_test.bin";
+let romn = vec_len rom;
+let rec load_rom = fn i -> if i >= romn then () else let _ = vec_set mem i (vec_get rom i) in load_rom (i + 1);
+let _ = load_rom 0;
+let _ = vec_set reg rSP 0xFF;
+let _ = vec_set reg rPC 0x0400;
+
+let rec drive = fn budget ->
+  if budget <= 0 then 0 - 1
+  else
+    let before = vec_get reg rPC in
+    let _ = step mem reg in
+    if vec_get reg rHALT == 1 then 0 - 2
+    else if vec_get reg rPC == before then before
+    else drive (budget - 1);
+
+let trap = drive 500000000;
+let _ = print ("trap_pc=" ++ str_of_int trap);
+let _ = print ("marker_0200=" ++ str_of_int (vec_get mem 0x200));
+0

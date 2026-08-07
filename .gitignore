@@ -5,3 +5,6 @@
 *.c
 *.out
 a.out
+
+# test ROMs (GPL, fetch separately) + compiled binaries
+*.bin

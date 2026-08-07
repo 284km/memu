@@ -12,7 +12,7 @@ the "what makes a CPU hard to emulate" problem on top of the one before it.
 | Emulator | File | What it adds over the previous rung |
 |----------|------|-------------------------------------|
 | **CHIP-8** | [`chip8.mere`](chip8.mere) | The basics: a byte-addressed memory, a register file, opcode decode with the bitwise builtins, a framebuffer, timers, and a seeded RNG. |
-| **MOS 6502** | [`mos6502.mere`](mos6502.mere) | A real 8-bit CPU: the rich 6502 addressing modes (immediate, zero-page[,X/Y], absolute[,X/Y], (indirect,X), (indirect),Y, relative), a status register whose flags are updated after every operation, and a hardware stack in page 1 (JSR/RTS). |
+| **MOS 6502** | [`mos6502.mere`](mos6502.mere) | A real 8-bit CPU: the rich 6502 addressing modes (immediate, zero-page[,X/Y], absolute[,X/Y], (indirect,X), (indirect),Y, relative), a status register whose flags are updated after every operation, and a hardware stack in page 1 (JSR/RTS). The **complete** core (all opcodes + decimal mode) passes Klaus Dörmann's functional test — see [`klaus/`](klaus/). |
 | **Game Boy (Sharp LR35902)** | [`gameboy.mere`](gameboy.mere) | 16-bit register *pairs* (BC/DE/HL/SP) and the **half-carry** flag — carry out of bit 3 on 8-bit ops and out of bit 11 on `ADD HL,rr`. Its regular opcode map is decoded from bit-fields, and the `CB` prefix opens a second opcode table (rotates / SWAP / BIT / RES / SET). |
 | **RISC-V RV32I** | [`riscv.mere`](riscv.mere) | A modern 32-bit ISA: 32 registers (x0 hardwired to 0), fixed-width 32-bit instructions in six formats (R/I/S/B/U/J) whose immediates are scattered across the word and must be reassembled and sign-extended. The test program is built by a tiny in-program assembler whose encoders mirror the emulator's decoders. |
 
