@@ -28,12 +28,38 @@ an X, and a filled disc:
 .:............................................................:.
 ```
 
-This is the headless foundation. A browser version would render the same
-framebuffer region to a `<canvas>` (reusing the DOM FFI the Game Boy playground
-uses) and feed input back through a memory-mapped register — a natural next
-step.
+## Interactive: input + per-frame presentation
+
+The console also has input and a frame loop. Two more externs complete the
+hardware contract, both lowered by `mere -rv`:
+
+- `key n` — read the held state of button `n` (0=right, 1=left, 2=up,
+  3=down): a byte load from an input register at `0x7F9000 + n`, which the host
+  refreshes each frame.
+- `present ()` — end the frame and yield to the host via `ecall a7=100`. The
+  CPU resumes on the *next* instruction next frame, so the cartridge's main
+  loop is a coroutine — the player's position lives on the RISC-V call stack,
+  not in any global.
+
+[`game.mere`](game.mere) is an arrow-key-playable cartridge (a block you move
+around a field). [`rv32i_play.mere`](rv32i_play.mere) drives it headlessly with
+a scripted input sequence, dumping the framebuffer after each frame so the
+player is seen to move — and clamp against the wall — without a browser:
+
+```sh
+MERE=/path/to/mere sh play.sh
+```
+
+### In the browser
+
+The same emulator, compiled to WebAssembly and wired to a `<canvas>` (ROM via
+`dom_rom_byte`, keys via `dom_key_held`, framebuffer blitted per frame), runs
+live at **merelang.org/playground/rvconsole.html** — a Mere-authored RV32IM CPU
+running a Mere-authored cartridge, in the browser.
 
 ## Notes
 - Requires the `mere` compiler (`$MERE`) and `clang`.
 - Graphics-only: the framebuffer is dumped only if the program wrote to it, so
   the emulator still runs ordinary (text) `mere -rv` programs unchanged.
+- `rv32i_console.mere` runs a one-shot cartridge to completion;
+  `rv32i_play.mere` adds the `key`/`present` frame loop.
