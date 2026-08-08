@@ -34,9 +34,14 @@ backends:
 | **1. timing + interrupts** ✅ | cycle table, timer, IME/IE/IF + vectors | Blargg `cpu_instrs` 11/11 |
 | **2. PPU** ✅ | background → window → sprites, scanline render → framebuffer | dmg-acid2 (recognizable) |
 | **3a. MBC1** ✅ | ROM bank switching ($2000-$3FFF) | combined 64 KB `cpu_instrs.gb` "Passed all tests" |
-| 3b. joypad | `$FF00` input | — (needed for interactive play) |
-| 4. browser | framebuffer → `<canvas>` via the `contrib/dom` FFI | a real homebrew `.gb` runs |
-| 5. (optional) APU | 4 sound channels | — |
+| **3b. joypad** ✅ | `$FF00` input | arrow keys move a sprite in the browser |
+| **4. browser** ✅ | framebuffer → `<canvas>`, dirty-pixel blit | a hand-written `.gb` runs, playable |
+| **5. APU** ✅ | two pulse channels → Web Audio | startup arpeggio + a beep while moving |
+
+The interactive milestones (3b–5) run as a Mere WebAssembly playground demo,
+**live at <https://merelang.org/playground/gameboy.html>** — the same machine
+core, compiled to Wasm and wired to a `<canvas>`, the keyboard, and Web Audio
+through a small host-import (`dom_*`) FFI. The full-machine arc is complete.
 
 **Milestone 3a — MBC1 (done).** Both `gb_machine.mere` and `gb_ppu.mere` now
 implement MBC1 ROM banking: bank 0 stays at `$0000-$3FFF` and a bank-select
