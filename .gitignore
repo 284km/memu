@@ -12,3 +12,8 @@ a.out
 # Game Boy test ROMs (fetch separately)
 *.gb
 blargg/roms/
+
+# RV32I differential-test scratch
+prog.bin
+rvdump
+rvdump.c
