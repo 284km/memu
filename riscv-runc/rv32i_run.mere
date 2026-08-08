@@ -227,7 +227,9 @@ let asm_j = fn imm -> fn rd -> fn op ->
 // --- run a real compiled program -----------------------------------------
 // Load a flat binary (objcopy'd from a freestanding RV32I ELF) at address 0,
 // set up the stack, and run from _start (PC=0) until the exit syscall.
-let mem = new_vec 524288 0;   // 512 KB — room for a newlib heap + stack
+let mem = new_vec 8388608 0;  // 8 MB — room for freestanding C, and for the
+                              // larger memory map that `mere -rv` output uses
+                              // (globals+heap at 2 MB, stack near 8 MB)
 let x = new_vec 32 0;
 let st = new_vec 2 0;
 let prog = read_file_bytes "prog.bin";
@@ -246,5 +248,7 @@ let sbuf = strbuf_new ();
 let n = vec_len out;
 let rec emit = fn i -> if i >= n then () else let _ = strbuf_push sbuf (chr (vec_get out i)) in emit (i + 1);
 let _ = emit 0;
-let _ = print (strbuf_to_str sbuf);
-0
+let _ = print_no_nl (strbuf_to_str sbuf);   // raw: don't append a newline
+// exit explicitly so the runtime doesn't echo this program's own final value
+// after the emulated program's output.
+exit 0

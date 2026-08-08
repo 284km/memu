@@ -24,7 +24,10 @@ against Klaus Dörmann's functional test ([`klaus/`](klaus/)), the Game Boy
 against Blargg's `cpu_instrs` ([`blargg/`](blargg/)), and RV32I by differential
 fuzzing against an independent reference ([`riscv-difftest/`](riscv-difftest/)).
 And a C program compiled by `gcc` to RISC-V runs on the RV32I core through a
-tiny `ecall` syscall ABI — see [`riscv-runc/`](riscv-runc/).
+tiny `ecall` syscall ABI — see [`riscv-runc/`](riscv-runc/). Going further,
+[Mere](https://github.com/merelang/mere) itself compiles straight to RV32IM
+(`mere -rv`) and runs on this emulator — including Mere's own self-hosted
+compiler — so the language runs on its own CPU. See [`riscv-mere/`](riscv-mere/).
 
 ## Running
 

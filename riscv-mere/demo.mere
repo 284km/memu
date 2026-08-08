@@ -1,0 +1,20 @@
+// A Mere program compiled straight to RV32IM machine code by `mere -rv`
+// and run on the Mere-written RISC-V emulator (../riscv-runc). No C
+// toolchain, no external assembler: the backend emits the flat binary.
+
+// integers + recursion
+let rec fib = fn n -> if n < 2 then n else fib (n - 1) + fib (n - 2);
+let rec fact = fn n -> if n <= 1 then 1 else n * fact (n - 1);
+
+// closures + higher-order + a hand-rolled list (ADT)
+type ilist = INil | ICons of (int * ilist);
+let rec sum = fn xs -> match xs with INil -> 0 | ICons (h, t) -> h + sum t;
+let twice = fn f -> fn x -> f (f x);
+
+// strings
+let _ = print ("fib(20)    = " ++ str_of_int (fib 20));
+let _ = print ("10!        = " ++ str_of_int (fact 10));
+let _ = print ("sum 1..4   = " ++ str_of_int (sum (ICons (1, ICons (2, ICons (3, ICons (4, INil)))))));
+let _ = print ("twice inc  = " ++ str_of_int (twice (fn n -> n + 1) 40));
+let _ = print (str_repeat "-" 24);
+let _ = print "compiled by `mere -rv`, run on the Mere RISC-V CPU.";
