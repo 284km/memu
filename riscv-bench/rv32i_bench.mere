@@ -1,0 +1,237 @@
+// rv32i_bench.mere — the RV32IM core (see ../riscv-runc/) with a drive loop
+// that counts executed instructions, for measuring emulator throughput. It
+// runs a flat RV32IM binary (bench.c) to the exit syscall and prints the
+// program output plus `instructions=<N>`. Time it on each backend to get MIPS.
+
+let mask32 = fn x -> bit_and x 4294967295;                 // 0xFFFFFFFF
+// interpret a 32-bit value as signed two's complement
+let signed32 = fn x ->
+  let m = mask32 x in
+  if bit_and m 2147483648 == 0 then m else m - 4294967296; // 0x80000000 / 2^32
+// sign-extend a `bits`-wide value already confined to `bits` bits
+let sign_ext = fn v -> fn bits ->
+  let half = bit_shl 1 (bits - 1) in
+  if bit_and v half == 0 then v else v - bit_shl 1 bits;
+// arithmetic right shift of a 32-bit value by s (0..31)
+let sra32 = fn v -> fn s ->
+  let m = mask32 v in
+  let r = bit_shr m s in
+  if bit_and m 2147483648 == 0 || s == 0 then mask32 r
+  else mask32 (bit_or r (bit_shl 4294967295 (32 - s)));
+
+let new_vec = fn n -> fn x ->
+  let v = vec_new () in
+  let rec go = fn i -> if i >= n then () else let _ = vec_push v x in go (i + 1) in
+  let _ = go 0 in v;
+
+// --- little-endian byte memory ------------------------------------------
+let ld32 = fn mem -> fn a ->
+  vec_get mem a + vec_get mem (a + 1) * 256 + vec_get mem (a + 2) * 65536 + vec_get mem (a + 3) * 16777216;
+let st32 = fn mem -> fn a -> fn v ->
+  let _ = vec_set mem a (bit_and v 255) in
+  let _ = vec_set mem (a + 1) (bit_and (bit_shr v 8) 255) in
+  let _ = vec_set mem (a + 2) (bit_and (bit_shr v 16) 255) in
+  vec_set mem (a + 3) (bit_and (bit_shr v 24) 255);
+
+// --- register file (x0 stays 0; writes to x0 are dropped) ----------------
+let wrx = fn x -> fn i -> fn v -> if i == 0 then () else vec_set x i (mask32 v);
+
+// unsigned 32x32 -> high 32 bits of the 64-bit product. Schoolbook over 16-bit
+// halves so every intermediate stays < 2^32 (safe on the 63-bit interpreter and
+// on the i64 native backends alike). gcc lowers `/`/`%` by a constant to a
+// MULHU by the reciprocal, so real -O2 output needs this.
+let mulhu32 = fn a -> fn b ->
+  let al = bit_and a 65535 in let ah = bit_shr (mask32 a) 16 in
+  let bl = bit_and b 65535 in let bh = bit_shr (mask32 b) 16 in
+  let ll = al * bl in
+  let lh = al * bh in
+  let hl = ah * bl in
+  let hh = ah * bh in
+  let mid = bit_shr ll 16 + bit_and lh 65535 + bit_and hl 65535 in
+  mask32 (hh + bit_shr lh 16 + bit_shr hl 16 + bit_shr mid 16);
+
+// --- immediate decoders (mirror the asm_* encoders below) ----------------
+let imm_i = fn inst -> sign_ext (bit_and (bit_shr inst 20) 4095) 12;
+let imm_s = fn inst ->
+  sign_ext (bit_or (bit_shl (bit_and (bit_shr inst 25) 127) 5) (bit_and (bit_shr inst 7) 31)) 12;
+let imm_b = fn inst ->
+  let b12 = bit_and (bit_shr inst 31) 1 in
+  let b11 = bit_and (bit_shr inst 7) 1 in
+  let b10_5 = bit_and (bit_shr inst 25) 63 in
+  let b4_1 = bit_and (bit_shr inst 8) 15 in
+  sign_ext (bit_or (bit_shl b12 12) (bit_or (bit_shl b11 11) (bit_or (bit_shl b10_5 5) (bit_shl b4_1 1)))) 13;
+let imm_u = fn inst -> bit_and inst 4294963200;            // 0xFFFFF000
+let imm_j = fn inst ->
+  let b20 = bit_and (bit_shr inst 31) 1 in
+  let b19_12 = bit_and (bit_shr inst 12) 255 in
+  let b11 = bit_and (bit_shr inst 20) 1 in
+  let b10_1 = bit_and (bit_shr inst 21) 1023 in
+  sign_ext (bit_or (bit_shl b20 20) (bit_or (bit_shl b19_12 12) (bit_or (bit_shl b11 11) (bit_shl b10_1 1)))) 21;
+
+// --- decode + execute one instruction ------------------------------------
+// st: [PC, HALT]
+// stdout buffer, filled by the ecall write(2) syscall
+let out = vec_new ();
+let step = fn mem -> fn x -> fn st ->
+  let pc = vec_get st 0 in
+  let inst = ld32 mem pc in
+  let _ = vec_set st 0 (mask32 (pc + 4)) in                // sequential next PC (branches override)
+  let op = bit_and inst 127 in
+  let rd = bit_and (bit_shr inst 7) 31 in
+  let f3 = bit_and (bit_shr inst 12) 7 in
+  let rs1 = bit_and (bit_shr inst 15) 31 in
+  let rs2 = bit_and (bit_shr inst 20) 31 in
+  let f7 = bit_and (bit_shr inst 25) 127 in
+  let a = vec_get x rs1 in
+  let b = vec_get x rs2 in
+  if op == 0x37 then wrx x rd (imm_u inst)                              // LUI
+  else if op == 0x17 then wrx x rd (mask32 (pc + imm_u inst))           // AUIPC
+  else if op == 0x6F then                                              // JAL
+    let _ = wrx x rd (mask32 (pc + 4)) in
+    vec_set st 0 (mask32 (pc + imm_j inst))
+  else if op == 0x67 then                                             // JALR
+    let t = bit_and (mask32 (a + imm_i inst)) 4294967294 in            // clear bit 0
+    let _ = wrx x rd (mask32 (pc + 4)) in
+    vec_set st 0 t
+  else if op == 0x63 then                                             // branches
+    let take =
+      if f3 == 0 then (if a == b then 1 else 0)                        // BEQ
+      else if f3 == 1 then (if a == b then 0 else 1)                   // BNE
+      else if f3 == 4 then (if signed32 a < signed32 b then 1 else 0)  // BLT
+      else if f3 == 5 then (if signed32 a >= signed32 b then 1 else 0) // BGE
+      else if f3 == 6 then (if mask32 a < mask32 b then 1 else 0)      // BLTU
+      else (if mask32 a >= mask32 b then 1 else 0) in                  // BGEU
+    if take == 1 then vec_set st 0 (mask32 (pc + imm_b inst)) else ()
+  else if op == 0x03 then                                             // loads
+    let addr = mask32 (a + imm_i inst) in
+    if f3 == 2 then wrx x rd (ld32 mem addr)                          // LW
+    else if f3 == 0 then wrx x rd (sign_ext (vec_get mem addr) 8)     // LB
+    else if f3 == 4 then wrx x rd (vec_get mem addr)                  // LBU
+    else if f3 == 1 then wrx x rd (sign_ext (vec_get mem addr + vec_get mem (mask32 (addr + 1)) * 256) 16)  // LH
+    else if f3 == 5 then wrx x rd (vec_get mem addr + vec_get mem (mask32 (addr + 1)) * 256)  // LHU
+    else ()
+  else if op == 0x23 then                                             // stores
+    let addr = mask32 (a + imm_s inst) in
+    if f3 == 2 then st32 mem addr b                                   // SW
+    else if f3 == 0 then vec_set mem addr (bit_and b 255)             // SB
+    else if f3 == 1 then                                              // SH
+      let _ = vec_set mem addr (bit_and b 255) in vec_set mem (mask32 (addr + 1)) (bit_and (bit_shr b 8) 255)
+    else ()
+  else if op == 0x13 then                                             // I-type ALU
+    let imm = imm_i inst in
+    if f3 == 0 then wrx x rd (mask32 (a + imm))                       // ADDI
+    else if f3 == 2 then wrx x rd (if signed32 a < imm then 1 else 0) // SLTI
+    else if f3 == 3 then wrx x rd (if mask32 a < mask32 imm then 1 else 0)  // SLTIU
+    else if f3 == 4 then wrx x rd (bit_xor a imm)                     // XORI
+    else if f3 == 6 then wrx x rd (bit_or a imm)                      // ORI
+    else if f3 == 7 then wrx x rd (bit_and a imm)                     // ANDI
+    else if f3 == 1 then wrx x rd (mask32 (bit_shl a (bit_and rs2 31)))     // SLLI
+    else if f7 == 0 then wrx x rd (bit_shr (mask32 a) (bit_and rs2 31))     // SRLI
+    else wrx x rd (sra32 a (bit_and rs2 31))                          // SRAI
+  else if op == 0x33 && f7 == 1 then                                  // RV32M (mul/div/rem)
+    (if f3 == 0 then wrx x rd (mask32 (a * b))                        // MUL (low 32)
+     else if f3 == 3 then wrx x rd (mulhu32 a b)                      // MULHU
+     else if f3 == 1 then                                            // MULH (signed x signed)
+       let uu = mulhu32 a b in
+       let an = bit_shr (mask32 a) 31 in let bn = bit_shr (mask32 b) 31 in
+       wrx x rd (mask32 (uu - (if an == 1 then mask32 b else 0) - (if bn == 1 then mask32 a else 0)))
+     else if f3 == 2 then                                            // MULHSU (signed x unsigned)
+       let uu = mulhu32 a b in
+       let an = bit_shr (mask32 a) 31 in
+       wrx x rd (mask32 (uu - (if an == 1 then mask32 b else 0)))
+     else if f3 == 4 then                                            // DIV (signed)
+       let sa = signed32 a in let sb = signed32 b in
+       if sb == 0 then wrx x rd 4294967295
+       else if sa == (0 - 2147483648) && sb == (0 - 1) then wrx x rd 2147483648
+       else wrx x rd (mask32 (sa / sb))
+     else if f3 == 5 then                                            // DIVU (unsigned)
+       let bu = mask32 b in
+       if bu == 0 then wrx x rd 4294967295 else wrx x rd (mask32 (mask32 a / bu))
+     else if f3 == 6 then                                            // REM (signed)
+       let sa = signed32 a in let sb = signed32 b in
+       if sb == 0 then wrx x rd (mask32 sa)
+       else if sa == (0 - 2147483648) && sb == (0 - 1) then wrx x rd 0
+       else wrx x rd (mask32 (sa - (sa / sb) * sb))
+     else if f3 == 7 then                                            // REMU (unsigned)
+       let au = mask32 a in let bu = mask32 b in
+       if bu == 0 then wrx x rd au else wrx x rd (mask32 (au - (au / bu) * bu))
+     else vec_set st 1 1)                                            // MULH/MULHSU/MULHU: not implemented
+  else if op == 0x33 then                                             // R-type ALU (base)
+    let sh = bit_and b 31 in
+    if f3 == 0 then (if f7 == 0 then wrx x rd (mask32 (a + b)) else wrx x rd (mask32 (a - b)))  // ADD/SUB
+    else if f3 == 1 then wrx x rd (mask32 (bit_shl a sh))             // SLL
+    else if f3 == 2 then wrx x rd (if signed32 a < signed32 b then 1 else 0)  // SLT
+    else if f3 == 3 then wrx x rd (if mask32 a < mask32 b then 1 else 0)      // SLTU
+    else if f3 == 4 then wrx x rd (bit_xor a b)                       // XOR
+    else if f3 == 5 then (if f7 == 0 then wrx x rd (bit_shr (mask32 a) sh) else wrx x rd (sra32 a sh))  // SRL/SRA
+    else if f3 == 6 then wrx x rd (bit_or a b)                        // OR
+    else wrx x rd (bit_and a b)                                       // AND
+  else if op == 0x73 then                                            // ECALL: minimal syscall ABI
+    let a7 = vec_get x 17 in                                         // syscall number
+    if a7 == 93 then vec_set st 1 1                                  // exit -> halt
+    else if a7 == 64 then                                            // write(fd, buf, len)
+      let buf = vec_get x 11 in
+      let len = vec_get x 12 in
+      let rec emit = fn i ->
+        if i >= len then () else let _ = vec_push out (vec_get mem (mask32 (buf + i))) in emit (i + 1) in
+      let _ = emit 0 in
+      vec_set x 10 len                                               // return bytes written in a0
+    else ()
+  else if op == 0x0F then ()                                          // FENCE -> nop
+  else vec_set st 1 1;                                                // unknown -> halt
+
+let rec run = fn mem -> fn x -> fn st -> fn budget ->
+  if budget <= 0 then ()
+  else if vec_get st 1 == 1 then ()
+  else let _ = step mem x st in run mem x st (budget - 1);
+
+// --- a tiny RV32I assembler (encoders mirror the imm_* decoders) ---------
+let asm_r = fn f7 -> fn rs2 -> fn rs1 -> fn f3 -> fn rd -> fn op ->
+  bit_or (bit_shl f7 25) (bit_or (bit_shl rs2 20) (bit_or (bit_shl rs1 15)
+    (bit_or (bit_shl f3 12) (bit_or (bit_shl rd 7) op))));
+let asm_i = fn imm -> fn rs1 -> fn f3 -> fn rd -> fn op ->
+  bit_or (bit_shl (bit_and imm 4095) 20) (bit_or (bit_shl rs1 15)
+    (bit_or (bit_shl f3 12) (bit_or (bit_shl rd 7) op)));
+let asm_s = fn imm -> fn rs2 -> fn rs1 -> fn f3 -> fn op ->
+  let i = bit_and imm 4095 in
+  bit_or (bit_shl (bit_shr i 5) 25) (bit_or (bit_shl rs2 20) (bit_or (bit_shl rs1 15)
+    (bit_or (bit_shl f3 12) (bit_or (bit_shl (bit_and i 31) 7) op))));
+let asm_b = fn imm -> fn rs2 -> fn rs1 -> fn f3 -> fn op ->
+  let i = bit_and imm 8191 in
+  let b12 = bit_and (bit_shr i 12) 1 in
+  let b11 = bit_and (bit_shr i 11) 1 in
+  let b10_5 = bit_and (bit_shr i 5) 63 in
+  let b4_1 = bit_and (bit_shr i 1) 15 in
+  bit_or (bit_shl b12 31) (bit_or (bit_shl b10_5 25) (bit_or (bit_shl rs2 20) (bit_or (bit_shl rs1 15)
+    (bit_or (bit_shl f3 12) (bit_or (bit_shl b4_1 8) (bit_or (bit_shl b11 7) op))))));
+let asm_j = fn imm -> fn rd -> fn op ->
+  let i = bit_and imm 2097151 in
+  let b20 = bit_and (bit_shr i 20) 1 in
+  let b19_12 = bit_and (bit_shr i 12) 255 in
+  let b11 = bit_and (bit_shr i 11) 1 in
+  let b10_1 = bit_and (bit_shr i 1) 1023 in
+  bit_or (bit_shl b20 31) (bit_or (bit_shl b19_12 12) (bit_or (bit_shl b11 20)
+    (bit_or (bit_shl b10_1 21) (bit_or (bit_shl rd 7) op))));
+
+// --- benchmark harness: run to exit, counting executed instructions --------
+let mem = new_vec 65536 0;
+let x = new_vec 32 0;
+let st = new_vec 2 0;
+let prog = read_file_bytes "prog.bin";
+let pn = vec_len prog;
+let rec load = fn i -> if i >= pn then () else let _ = vec_set mem i (vec_get prog i) in load (i + 1);
+let _ = load 0;
+let _ = vec_set x 2 0xF000;
+let _ = vec_set st 0 0;
+let rec drive = fn budget -> fn count ->
+  if budget <= 0 then count
+  else if vec_get st 1 == 1 then count
+  else let _ = step mem x st in drive (budget - 1) (count + 1);
+let insts = drive 2000000000 0;
+let sbuf = strbuf_new ();
+let n = vec_len out;
+let rec emit = fn i -> if i >= n then () else let _ = strbuf_push sbuf (chr (vec_get out i)) in emit (i + 1);
+let _ = emit 0;
+let _ = print (strbuf_to_str sbuf);
+let _ = print ("instructions=" ++ str_of_int insts);
+0
