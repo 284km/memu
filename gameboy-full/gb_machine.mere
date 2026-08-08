@@ -18,11 +18,13 @@
 // 11/11 "Passed" on the interpreter, C, and LLVM backends. (The CPU-only core
 // in ../blargg/ passes 10/11; this machine closes the interrupt gap.)
 //
-// It maps a 32 KB test ROM flat at $0000, starts at $0100 with post-boot
-// register values, and captures the serial port ($FF01/$FF02). Still ahead on
-// the arc: the PPU (background/window/sprites -> a framebuffer), MBC cartridge
-// banking, joypad input, and wiring the framebuffer to a browser canvas to run
-// a real .gb game. ROMs are not redistributed — see run.sh to fetch them.
+// It also implements MBC1 cartridge banking (bank 0 fixed at $0000-$3FFF, the
+// selected bank copied into the $4000-$7FFF window on a bank-select write), so
+// it runs both 32 KB ROMs and larger MBC1 carts — e.g. the combined 64 KB
+// cpu_instrs.gb steps through all 11 sub-tests across banks and prints
+// "Passed all tests". Still ahead on the arc: joypad input, wiring the PPU
+// framebuffer (see gb_ppu.mere) to a browser canvas for a playable game, and
+// APU sound. ROMs are not redistributed — see run.sh to fetch them.
 
 let mask8  = fn x -> bit_and x 255;
 let mask16 = fn x -> bit_and x 65535;
@@ -38,11 +40,29 @@ let rA=0; let rB=1; let rC=2; let rD=3; let rE=4; let rH=5; let rL=6;
 let rSP=7; let rPC=8; let fZ=9; let fN=10; let fH=11; let fC=12; let rIME=13; let rHALT=14;
 let rHALTED=15; let rEI=16;   // HALT-waiting flag; EI-enable delay counter
 
-// memory: ROM area ($0000-$7FFF) is read-only (ignore writes = MBC regs)
+// memory + MBC1 cartridge banking. The full ROM lives in `rom`; bank 0 is fixed
+// at $0000-$3FFF and the selected bank is copied into the $4000-$7FFF window on
+// a bank-select write ($2000-$3FFF), so ordinary reads stay plain mem[].
+let mem = new_vec 65536 0;
+let rom = read_file_bytes "rom.gb";
+let romn = vec_len rom;
+let mbc = new_vec 1 1;    // [current ROM bank]
+let set_bank = fn b ->
+  let bb = if b == 0 then 1 else b in
+  let _ = vec_set mbc 0 bb in
+  let base = bb * 16384 in
+  let rec cp = fn i -> if i >= 16384 then () else
+    let _ = vec_set mem (16384 + i) (if base + i < romn then vec_get rom (base + i) else 0) in cp (i + 1) in
+  cp 0;
+let rec initload = fn i -> if i >= 32768 then () else
+  let _ = vec_set mem i (if i < romn then vec_get rom i else 0) in initload (i + 1);
+let _ = initload 0;
 let rd = fn mem -> fn a -> vec_get mem (mask16 a);
 let wr = fn mem -> fn a -> fn v ->
   let addr = mask16 a in
-  if addr < 0x8000 then () else vec_set mem addr (mask8 v);
+  if addr >= 0x2000 && addr <= 0x3FFF then set_bank (bit_and v 31)   // MBC1 ROM bank select
+  else if addr < 0x8000 then ()                                      // other ROM-area writes: ignore
+  else vec_set mem addr (mask8 v);
 
 let fetch = fn mem -> fn reg ->
   let pc = vec_get reg rPC in let b = vec_get mem pc in
@@ -339,14 +359,10 @@ let step = fn mem -> fn reg ->
 // M-cycle table (T-cycles / 4) for base opcodes; CB handled separately.
 let ctab = bytes_of_hex "01030202010102010502020201010201010302020101020103020202010102010203020201010201020202020101020102030202030303010202020201010201010101010101020101010101010102010101010101010201010101010101020101010101010102010101010101010201020202020202010201010101010102010101010101010201010101010101020101010101010102010101010101010201010101010101020101010101010102010101010101010201010101010101020102030304030402040204030103060204020303000304020402040300030002040303020000040204040104000000020403030201000402040302040100000204";
 
-let mem = new_vec 65536 0;
 let reg = new_vec 17 0;
 let ser = vec_new ();
 let sys = new_vec 2 0;      // [div T-accumulator, tima T-accumulator]
-let rom = read_file_bytes "rom.gb";
-let romn = vec_len rom;
-let rec loadrom = fn i -> if i >= romn then () else let _ = vec_set mem i (vec_get rom i) in loadrom (i + 1);
-let _ = loadrom 0;
+// mem/rom loaded at the top (with MBC1); nothing to load here
 // post-boot register state
 let _ = vec_set reg rA 0x01;
 let _ = set_bc reg 0x0013; let _ = set_de reg 0x00D8; let _ = set_hl reg 0x014D;
@@ -423,7 +439,7 @@ let rec drive = fn budget ->
     let _ = service () in
     drive (budget - 1);
 
-let trap = drive 20000000;
+let trap = drive 60000000;
 let sbuf = strbuf_new ();
 let n = vec_len ser;
 let rec emit = fn i -> if i >= n then () else let _ = strbuf_push sbuf (chr (vec_get ser i)) in emit (i + 1);

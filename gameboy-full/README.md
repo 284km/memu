@@ -33,9 +33,17 @@ backends:
 |-----------|------|-------------|
 | **1. timing + interrupts** ✅ | cycle table, timer, IME/IE/IF + vectors | Blargg `cpu_instrs` 11/11 |
 | **2. PPU** ✅ | background → window → sprites, scanline render → framebuffer | dmg-acid2 (recognizable) |
-| 3. MBC + joypad | MBC1/3 bank switching, `$FF00` input | boots a real cartridge |
+| **3a. MBC1** ✅ | ROM bank switching ($2000-$3FFF) | combined 64 KB `cpu_instrs.gb` "Passed all tests" |
+| 3b. joypad | `$FF00` input | — (needed for interactive play) |
 | 4. browser | framebuffer → `<canvas>` via the `contrib/dom` FFI | a real homebrew `.gb` runs |
 | 5. (optional) APU | 4 sound channels | — |
+
+**Milestone 3a — MBC1 (done).** Both `gb_machine.mere` and `gb_ppu.mere` now
+implement MBC1 ROM banking: bank 0 stays at `$0000-$3FFF` and a bank-select
+write (`$2000-$3FFF`) copies the chosen bank into the `$4000-$7FFF` window. The
+combined 64 KB `cpu_instrs.gb` — which the 11 individual tests are packed into,
+reached by switching banks — now runs end to end and prints **"Passed all
+tests"**. So the machine runs both 32 KB ROMs and larger MBC1 carts.
 
 **Milestone 2 — PPU (done).** [`gb_ppu.mere`](gb_ppu.mere) adds the picture
 processing unit on top of the machine: LCD timing (LY / VBlank), a scrolled

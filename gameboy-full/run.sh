@@ -31,4 +31,12 @@ for name in $TESTS; do
   printf '%-24s -> %s\n' "$name" "${res:-<none>}"
 done
 IFS=$OLDIFS
+
+# MBC1 demo: the combined 64 KB cpu_instrs.gb runs all 11 sub-tests across banks
+echo
+echo "combined cpu_instrs.gb (MBC1):"
+crom="$DIR/roms/cpu_instrs.gb"
+[ -f "$crom" ] || curl -sSL -o "$crom" "https://raw.githubusercontent.com/retrio/gb-test-roms/master/cpu_instrs/cpu_instrs.gb"
+cp "$crom" "$DIR/rom.gb"
+( cd "$DIR" && ./gb 2>&1 | grep -iE 'passed|failed' | head -1 | tr -d '\r' )
 rm -f "$DIR/rom.gb" "$DIR/gb" "$DIR/gb.c"
