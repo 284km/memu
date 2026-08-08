@@ -25,3 +25,4 @@ rvrun.c
 
 # hello.c is a real source file, not generated C
 !riscv-runc/hello.c
+!riscv-runc/app.c
