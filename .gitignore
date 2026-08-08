@@ -8,3 +8,7 @@ a.out
 
 # test ROMs (GPL, fetch separately) + compiled binaries
 *.bin
+
+# Game Boy test ROMs (fetch separately)
+*.gb
+blargg/roms/
