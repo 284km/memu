@@ -17,3 +17,11 @@ blargg/roms/
 prog.bin
 rvdump
 rvdump.c
+
+# RV32I real-software build artifacts
+hello.elf
+rvrun
+rvrun.c
+
+# hello.c is a real source file, not generated C
+!riscv-runc/hello.c

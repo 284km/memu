@@ -19,6 +19,13 @@ the "what makes a CPU hard to emulate" problem on top of the one before it.
 Everything is 8-/16-/32-bit integer work over a flat `Vec[int]` memory, so the
 programs are fully deterministic and byte-identical across the four backends.
 
+The three real CPUs are also validated against external references: the 6502
+against Klaus Dörmann's functional test ([`klaus/`](klaus/)), the Game Boy
+against Blargg's `cpu_instrs` ([`blargg/`](blargg/)), and RV32I by differential
+fuzzing against an independent reference ([`riscv-difftest/`](riscv-difftest/)).
+And a C program compiled by `gcc` to RISC-V runs on the RV32I core through a
+tiny `ecall` syscall ABI — see [`riscv-runc/`](riscv-runc/).
+
 ## Running
 
 You need the [Mere](https://github.com/merelang/mere) compiler on your `PATH`
