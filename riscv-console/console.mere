@@ -1,0 +1,20 @@
+// A Mere program that draws to the fantasy-console framebuffer and runs on
+// the RISC-V emulator. `fb_set x y v` (an extern the -rv backend lowers to a
+// framebuffer store) sets pixel (x,y) to shade v (0..7). No C, no assembler.
+extern fn fb_set: int -> int -> int -> unit;
+
+let rec forx = fn y -> fn x -> fn f -> if x >= 64 then () else let _ = f x y in forx y (x + 1) f;
+let rec fory = fn y -> fn f -> if y >= 32 then () else let _ = forx y 0 f in fory (y + 1) f;
+
+let _ = fory 0 (fn x -> fn y ->
+  let border = if x == 0 || x == 63 || y == 0 || y == 31 then 1 else 0 in
+  let dx = x - 32 in
+  let dy = (y - 16) * 2 in
+  let d2 = dx * dx + dy * dy in
+  let blob = if d2 < 210 then 7 else 0 in
+  let ring = if d2 < 380 then 3 else 0 in
+  let diag = if x == y * 2 || x == 63 - y * 2 then 2 else 0 in
+  let v = if blob > 0 then blob else if ring > 0 then ring else if diag > 0 then diag else border in
+  fb_set x y v);
+let _ = print "drawn by a Mere program on the RISC-V CPU:";
+()
