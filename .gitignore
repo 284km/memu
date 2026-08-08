@@ -27,3 +27,5 @@ rvrun.c
 !riscv-runc/hello.c
 !riscv-runc/app.c
 !riscv-bench/bench.c
+gameboy-full/roms/
+gameboy-full/gb
