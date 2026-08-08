@@ -32,10 +32,23 @@ backends:
 | Milestone | Adds | Verified by |
 |-----------|------|-------------|
 | **1. timing + interrupts** ✅ | cycle table, timer, IME/IE/IF + vectors | Blargg `cpu_instrs` 11/11 |
-| 2. PPU | background → window → sprites, scanline render → framebuffer | dmg-acid2 / visual |
+| **2. PPU** ✅ | background → window → sprites, scanline render → framebuffer | dmg-acid2 (recognizable) |
 | 3. MBC + joypad | MBC1/3 bank switching, `$FF00` input | boots a real cartridge |
 | 4. browser | framebuffer → `<canvas>` via the `contrib/dom` FFI | a real homebrew `.gb` runs |
 | 5. (optional) APU | 4 sound channels | — |
+
+**Milestone 2 — PPU (done).** [`gb_ppu.mere`](gb_ppu.mere) adds the picture
+processing unit on top of the machine: LCD timing (LY / VBlank), a scrolled
+background, the window, and sprites (8×8/8×16, X/Y flip, OBP0/OBP1, the
+behind-background priority bit), rendered scanline-by-scanline into a 160×144
+framebuffer. Running mattcurrie's `dmg-acid2` PPU test ROM draws its reference
+face — header text, eyes/nose/mouth, and the head outline — recognizably on the
+interpreter, C, and LLVM backends. (Pixel-exact dmg-acid2 additionally wants the
+10-sprites-per-line limit and X-coordinate priority — a later refinement.)
+
+```sh
+MERE=/path/to/mere sh ppu.sh     # fetches dmg-acid2 and dumps the frame as ASCII
+```
 
 ## Running (milestone 1)
 

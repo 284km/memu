@@ -29,3 +29,4 @@ rvrun.c
 !riscv-bench/bench.c
 gameboy-full/roms/
 gameboy-full/gb
+gameboy-full/gbppu
