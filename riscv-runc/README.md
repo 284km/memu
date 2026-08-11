@@ -69,6 +69,8 @@ address does not move when the RAM size does. One device so far:
 | `0x10000000` | UART data (write) | the byte goes to stdout as it happens |
 | `0x10000000` | UART data (read) | the next byte of the host's stdin |
 | `0x10000005` | UART line status (read) | bit 5 transmitter ready (always), bit 0 data waiting |
+| `0x10008000` | CLINT mtime | a monotonic counter, one tick per instruction |
+| `0x10008008` | CLINT mtimecmp | the deadline; reaching it raises a timer interrupt |
 
 The receive side keeps one byte of lookahead, because a guest asks "is anything
 waiting?" before it asks "what is it?". Finding out uses Mere's `stdin_byte`,
@@ -87,13 +89,37 @@ through a window capability rather than any host syscall — in both directions:
 printf 'hello\nq' | ./rvrun     # against the Mere repo's riscv_bare_echo example
 ```
 
-## CSRs and traps
+## CSRs, traps and the timer
 
 The machine's control-and-status registers are a flat 4096-slot file, so
 `csrrw` / `csrrs` / `csrrc` and their immediate forms work on any number, and
 `mret` returns to `mepc` while restoring the interrupt-enable bit from `MPIE`.
-`wfi` is a nop. Nothing generates a trap yet — that is what the CSRs are here
-for next.
+`wfi` is a nop.
+
+Traps vector to `mtvec` (direct mode) with the faulting PC in `mepc`, the reason
+in `mcause` and the offending value in `mtval`, and `MIE` moved into `MPIE` so
+`mret` can put it back:
+
+| `mcause` | when |
+|----------|------|
+| 2 | an instruction this core does not implement |
+| 5 / 7 | a load / store past the end of RAM |
+| `0x80000007` | the timer: `mtime` reached `mtimecmp`, with `MIE` and `MTIE` set |
+
+A guest with `mtvec` still zero has nowhere to go, so it halts — as it did
+before traps existed, rather than jumping to address 0 and overwriting itself.
+The access faults are the interesting ones for anyone writing a guest: an
+address past RAM used to take the *emulator* down with a Mere "index out of
+bounds", reporting the host's problem instead of the guest's.
+
+`mtime` advances once per instruction. That is a clock in units of work done,
+which is what a deterministic emulator can honestly offer, and it is enough for
+a scheduler tick. The interrupt is taken between instructions — the only point
+where the machine is in a consistent state to vector away from.
+
+The Mere side of this is `set_trap_handler`, which takes an ordinary closure:
+see the main repo's `examples/riscv_bare_timer.mere`, where a machine interrupts
+itself and a Mere handler services the timer while the main loop just spins.
 
 ## Running your own
 

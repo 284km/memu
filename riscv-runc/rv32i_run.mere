@@ -90,8 +90,17 @@ let out = vec_new ();
 // at QEMU virt's 0x10000000: a byte store goes to stdout as it happens, which
 // is what a shell needs and what the buffered `out` above cannot give.
 let mmio_base = 268435456;   // 0x10000000
+// A minimal CLINT: a monotonic counter and a comparand. Both 32-bit here, where
+// the real thing is 64-bit — a 32-bit mtime is enough for a scheduler tick and
+// keeps every access a single word.
+let clint_mtime = 268468224;      // 0x10008000
+let clint_mtimecmp = 268468232;   // 0x10008008
+let timer = new_vec 2 0;          // [mtime, mtimecmp]
 let mmio_store = fn addr -> fn v ->
-  if addr == mmio_base then print_no_nl (chr (bit_and v 255)) else ();
+  if addr == mmio_base then print_no_nl (chr (bit_and v 255))
+  else if addr == clint_mtimecmp then vec_set timer 1 (mask32 v)
+  else if addr == clint_mtime then vec_set timer 0 (mask32 v)
+  else ();
 
 // Receive side: one byte of lookahead, because the guest asks "is anything
 // waiting?" before it asks "what is it?". `stdin_byte` polls without blocking
@@ -102,7 +111,9 @@ let rx_poll = fn () ->
   if vec_get rx 0 < 0 then vec_set rx 0 (stdin_byte ()) else ();
 // 16550 line status: bit 5 = transmitter empty (always), bit 0 = data ready.
 let mmio_load = fn addr ->
-  if addr == mmio_base + 5 then
+  if addr == clint_mtime then vec_get timer 0
+  else if addr == clint_mtimecmp then vec_get timer 1
+  else if addr == mmio_base + 5 then
     let _ = rx_poll () in
     if vec_get rx 0 >= 0 then 97 else 96
   else if addr == mmio_base then
@@ -117,7 +128,29 @@ let mmio_load = fn addr ->
 // mscratch are just numbers until traps arrive, and `mret` reads mepc.
 let csr = new_vec 4096 0;
 let csr_mstatus = 768;   // 0x300
+let csr_mtvec = 773;     // 0x305
 let csr_mepc = 833;      // 0x341
+let csr_mcause = 834;    // 0x342
+let csr_mtval = 835;     // 0x343
+
+// Take a trap: park the faulting PC in mepc, the reason in mcause, the offending
+// value in mtval, move MIE into MPIE (so mret can put it back), and vector to
+// mtvec. Direct mode only — the low two bits of mtvec select vectored mode,
+// which nothing here needs, so they are masked off.
+// A guest with mtvec still zero has nowhere to go: that halts, as it did before
+// traps existed, rather than jumping to address 0 and corrupting itself.
+let take_trap = fn st -> fn cause -> fn tval -> fn pc ->
+  let tvec = vec_get csr csr_mtvec in
+  if tvec == 0 then vec_set st 1 1
+  else
+    let ms = vec_get csr csr_mstatus in
+    let mie = bit_and (bit_shr ms 3) 1 in
+    let _ = vec_set csr csr_mstatus
+              (bit_or (bit_and ms 4294967175) (bit_shl mie 7)) in  // MIE=0, MPIE=MIE
+    let _ = vec_set csr csr_mepc (mask32 pc) in
+    let _ = vec_set csr csr_mcause (mask32 cause) in
+    let _ = vec_set csr csr_mtval (mask32 tval) in
+    vec_set st 0 (bit_and tvec 4294967292);
 let step = fn mem -> fn x -> fn st ->
   let pc = vec_get st 0 in
   let inst = ld32 mem pc in
@@ -151,6 +184,10 @@ let step = fn mem -> fn x -> fn st ->
   else if op == 0x03 then                                             // loads
     let addr = mask32 (a + imm_i inst) in
     if addr >= mmio_base then wrx x rd (mmio_load addr)               // device
+    // Past the end of RAM: the guest's mistake, so it becomes the guest's trap
+    // (load access fault). This used to take the emulator down with a Mere
+    // "index out of bounds", which reported the host's problem, not the guest's.
+    else if addr + 3 >= vec_len mem then take_trap st 5 addr pc
     else if f3 == 2 then wrx x rd (ld32 mem addr)                     // LW
     else if f3 == 0 then wrx x rd (sign_ext (vec_get mem addr) 8)     // LB
     else if f3 == 4 then wrx x rd (vec_get mem addr)                  // LBU
@@ -160,6 +197,7 @@ let step = fn mem -> fn x -> fn st ->
   else if op == 0x23 then                                             // stores
     let addr = mask32 (a + imm_s inst) in
     if addr >= mmio_base then mmio_store addr b                       // device
+    else if addr + 3 >= vec_len mem then take_trap st 7 addr pc        // store access fault
     else if f3 == 2 then st32 mem addr b                              // SW
     else if f3 == 0 then vec_set mem addr (bit_and b 255)             // SB
     else if f3 == 1 then                                              // SH
@@ -250,7 +288,7 @@ let step = fn mem -> fn x -> fn st ->
         vec_set x 10 len                                             // return bytes written in a0
       else ()
   else if op == 0x0F then ()                                          // FENCE -> nop
-  else vec_set st 1 1;                                                // unknown -> halt
+  else take_trap st 2 inst pc;                                        // illegal instruction
 
 let rec run = fn mem -> fn x -> fn st -> fn budget ->
   if budget <= 0 then ()
@@ -309,8 +347,29 @@ let _ = vec_set st 0 0;          // PC = 0 = _start
 // not implement. There is no instruction budget: the self-hosted Mere compiler
 // needs well past the 100M this used to cap at, and a kernel-shaped guest never
 // returns at all. Ctrl-C is the way out of a runaway guest.
+// mtime advances once per instruction — a clock in units of work done, which is
+// what a deterministic emulator can honestly offer. A timer interrupt is taken
+// between instructions, the only point where the machine is in a consistent
+// state to vector away from.
+let csr_mie = 772;       // 0x304, bit 7 = MTIE
+let csr_mip = 836;       // 0x344, bit 7 = MTIP
+let timer_pending = fn () ->
+  let armed = vec_get timer 1 in
+  if armed == 0 then 0
+  else if vec_get timer 0 < armed then 0
+  else if bit_and (bit_shr (vec_get csr csr_mstatus) 3) 1 == 0 then 0   // MIE off
+  else if bit_and (bit_shr (vec_get csr csr_mie) 7) 1 == 0 then 0       // MTIE off
+  else 1;
 let rec drive = fn () ->
-  if vec_get st 1 == 1 then () else let _ = step mem x st in drive ();
+  if vec_get st 1 == 1 then ()
+  else
+    let _ = vec_set timer 0 (mask32 (vec_get timer 0 + 1)) in
+    let _ =
+      if timer_pending () == 1 then
+        let _ = vec_set csr csr_mip (bit_or (vec_get csr csr_mip) 128) in
+        take_trap st 2147483655 0 (vec_get st 0)      // 0x80000007: machine timer
+      else () in
+    if vec_get st 1 == 1 then () else let _ = step mem x st in drive ();
 let _ = drive ();
 
 // print the bytes the program wrote via ecall write(2)
