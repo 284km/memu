@@ -227,9 +227,14 @@ let asm_j = fn imm -> fn rd -> fn op ->
 // --- run a real compiled program -----------------------------------------
 // Load a flat binary (objcopy'd from a freestanding RV32I ELF) at address 0,
 // set up the stack, and run from _start (PC=0) until the exit syscall.
-let mem = new_vec 8388608 0;  // 8 MB — room for freestanding C, and for the
-                              // larger memory map that `mere -rv` output uses
-                              // (globals+heap at 2 MB, stack near 8 MB)
+// RAM size in MB, from the first argument (default 8). `mere -rv` lays its
+// stack at the top of RAM, so the emulator has to be sized to match: plain
+// `mere -rv` assumes 8 MB and `mere -rv --ram N` assumes N. 8 MB also leaves
+// room for freestanding C (globals+heap at 2 MB, stack near the top).
+let ram_mb = match args () with
+  | Cons (a, _) -> int_of_str a
+  | Nil -> 8;
+let mem = new_vec (ram_mb * 1048576) 0;
 let x = new_vec 32 0;
 let st = new_vec 2 0;
 let prog = read_file_bytes "prog.bin";
@@ -239,9 +244,13 @@ let _ = load 0;
 let _ = vec_set x 2 0x70000;     // sp near the top of RAM (the program also sets it)
 let _ = vec_set st 0 0;          // PC = 0 = _start
 
-let rec drive = fn budget ->
-  if budget <= 0 then () else if vec_get st 1 == 1 then () else let _ = step mem x st in drive (budget - 1);
-let _ = drive 100000000;
+// Run until the guest halts — an exit syscall, or an instruction the core does
+// not implement. There is no instruction budget: the self-hosted Mere compiler
+// needs well past the 100M this used to cap at, and a kernel-shaped guest never
+// returns at all. Ctrl-C is the way out of a runaway guest.
+let rec drive = fn () ->
+  if vec_get st 1 == 1 then () else let _ = step mem x st in drive ();
+let _ = drive ();
 
 // print the bytes the program wrote via ecall write(2)
 let sbuf = strbuf_new ();

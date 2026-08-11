@@ -58,3 +58,8 @@ it (`-march=rv32im -mabi=ilp32 -nostdlib -lgcc`, linked at address 0 by
 
 Swap in your own C — keep it freestanding (no libc beyond the two syscalls) and
 within RV32IM — and it runs just the same.
+
+The emulator takes an optional RAM size in MB (`./rvrun 20`), defaulting to 8.
+It matters for `mere -rv` output, whose stack starts at the top of RAM: see
+[`../riscv-mere`](../riscv-mere). There is no instruction budget — the guest
+runs until it halts, so Ctrl-C is the way out of a runaway program.

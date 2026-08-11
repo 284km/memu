@@ -28,22 +28,40 @@ strings — all compiled to RV32IM and run on the emulator.
 
 The headline: the Mere **self-hosted compiler** (lexer + parser + type checker
 + WebAssembly codegen, all written in Mere, in the main repo's `contrib/`)
-compiles with `mere -rv` to a ~380 KB RV32IM binary and runs on this emulator,
+compiles with `mere -rv` to a ~300 KB RV32IM binary and runs on this emulator,
 producing WAT output byte-identical to the native interpreter. The Mere
 compiler compiling Mere programs, on the Mere CPU.
 
+It needs more than the default 8 MB — the compiler's heap peaks somewhere
+between 14 and 18 MB, and `mere -rv`'s allocator never reclaims — so both
+sides have to be told about it:
+
+```sh
+mere -rv --ram 20 driver.mere > prog.bin   # stack starts at the top of 20 MB
+./rvrun 20                                 # emulator sized to match
+```
+
+Give the emulator a smaller address space than the binary was built for and it
+will run off the end of memory immediately; give the binary less RAM than it
+needs and it stops with `mere: out of memory (heap reached the stack)`.
+
 ## How the binary is laid out
 
-`mere -rv` emits code at address 0 and uses this memory map (which is why the
-emulator has an 8 MB address space):
+`mere -rv` emits code at address 0 and lays out the rest from the RAM size —
+8 MB unless `--ram` says otherwise, which is the default this emulator uses
+when given no argument:
 
 ```
 0x000000  code (starts at _start)
 0x200000  globals + heap  (grows up)
    ...
-0x7E0000  stack  (grows down)
-0x7F0000  print scratch buffer
+          stack  (grows down from 128 KB below the top of RAM)
+          print scratch buffer, framebuffer, keys  (the reserved top 128 KB)
 ```
+
+The heap and the stack grow toward each other with nothing in between; every
+allocation checks for the collision and stops with a message rather than
+overwriting a live frame.
 
 Values are 32-bit words (an int, or a pointer into the heap); tuples, ADTs,
 records, strings, closures, and Vec/Map are heap blocks. A small runtime
