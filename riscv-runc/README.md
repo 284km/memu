@@ -59,6 +59,26 @@ it (`-march=rv32im -mabi=ilp32 -nostdlib -lgcc`, linked at address 0 by
 Swap in your own C — keep it freestanding (no libc beyond the two syscalls) and
 within RV32IM — and it runs just the same.
 
+## Devices
+
+Addresses at or above `0x10000000` are device MMIO rather than RAM, so a device
+address does not move when the RAM size does. One device so far:
+
+| address | register | behaviour |
+|---------|----------|-----------|
+| `0x10000000` | UART data (write) | the byte goes to stdout as it happens |
+| `0x10000005` | UART line status (read) | `0x60`: transmitter ready, nothing received |
+
+`0x10000000` is where QEMU's `virt` machine puts UART0, so a guest driver
+written against it is not learning a private convention. Unlike the `ecall`
+write syscall — which buffers until the guest halts — the UART streams, which
+is what a guest that never exits needs.
+
+`mere -rv --bare` compiles a Mere program that drives this UART directly,
+through a window capability rather than any host syscall.
+
+## Running your own
+
 The emulator takes an optional RAM size in MB (`./rvrun 20`), defaulting to 8.
 It matters for `mere -rv` output, whose stack starts at the top of RAM: see
 [`../riscv-mere`](../riscv-mere). There is no instruction budget — the guest

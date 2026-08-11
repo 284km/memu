@@ -83,6 +83,18 @@ let imm_j = fn inst ->
 // st: [PC, HALT]
 // stdout buffer, filled by the ecall write(2) syscall
 let out = vec_new ();
+
+// --- device MMIO ----------------------------------------------------------
+// Devices live above any RAM, so a device address does not move when the RAM
+// size does and a guest can name one as a literal. The UART data register is
+// at QEMU virt's 0x10000000: a byte store goes to stdout as it happens, which
+// is what a shell needs and what the buffered `out` above cannot give.
+let mmio_base = 268435456;   // 0x10000000
+let mmio_store = fn addr -> fn v ->
+  if addr == mmio_base then print_no_nl (chr (bit_and v 255)) else ();
+// 16550 line-status register: transmitter always ready, nothing received yet.
+let mmio_load = fn addr ->
+  if addr == mmio_base + 5 then 96 else 0;
 let step = fn mem -> fn x -> fn st ->
   let pc = vec_get st 0 in
   let inst = ld32 mem pc in
@@ -115,7 +127,8 @@ let step = fn mem -> fn x -> fn st ->
     if take == 1 then vec_set st 0 (mask32 (pc + imm_b inst)) else ()
   else if op == 0x03 then                                             // loads
     let addr = mask32 (a + imm_i inst) in
-    if f3 == 2 then wrx x rd (ld32 mem addr)                          // LW
+    if addr >= mmio_base then wrx x rd (mmio_load addr)               // device
+    else if f3 == 2 then wrx x rd (ld32 mem addr)                     // LW
     else if f3 == 0 then wrx x rd (sign_ext (vec_get mem addr) 8)     // LB
     else if f3 == 4 then wrx x rd (vec_get mem addr)                  // LBU
     else if f3 == 1 then wrx x rd (sign_ext (vec_get mem addr + vec_get mem (mask32 (addr + 1)) * 256) 16)  // LH
@@ -123,7 +136,8 @@ let step = fn mem -> fn x -> fn st ->
     else ()
   else if op == 0x23 then                                             // stores
     let addr = mask32 (a + imm_s inst) in
-    if f3 == 2 then st32 mem addr b                                   // SW
+    if addr >= mmio_base then mmio_store addr b                       // device
+    else if f3 == 2 then st32 mem addr b                              // SW
     else if f3 == 0 then vec_set mem addr (bit_and b 255)             // SB
     else if f3 == 1 then                                              // SH
       let _ = vec_set mem addr (bit_and b 255) in vec_set mem (mask32 (addr + 1)) (bit_and (bit_shr b 8) 255)
