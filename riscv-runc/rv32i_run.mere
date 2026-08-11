@@ -35,14 +35,32 @@ let new_vec = fn n -> fn x ->
   let rec go = fn i -> if i >= n then () else let _ = vec_push v x in go (i + 1) in
   let _ = go 0 in v;
 
+// --- where RAM is ---------------------------------------------------------
+// Address 0 by default: this backend's own layout, code from 0 and devices
+// above it. Pass `virt` as the second argument for QEMU's virt board, where
+// DRAM starts at 2 GB and every device sits below it — so an image built with
+// `mere -rv --load-base 0x80000000` runs *here* as well as on QEMU, and the
+// two can be diffed against each other.
+//
+// The addresses inside the core stay absolute, exactly as the guest computes
+// them; only these four accessors know where RAM landed.
+let virt = match args () with
+  | Cons (_, Cons (b, _)) -> if str_eq b "virt" then 1 else 0
+  | _ -> 0;
+let dram_base = if virt == 1 then 2147483648 else 0;      // 0x80000000
+
 // --- little-endian byte memory ------------------------------------------
+let ldb = fn mem -> fn a -> vec_get mem (a - dram_base);
+let stb = fn mem -> fn a -> fn v -> vec_set mem (a - dram_base) (bit_and v 255);
+let in_ram = fn mem -> fn a ->
+  a >= dram_base && a - dram_base + 3 < vec_len mem;
 let ld32 = fn mem -> fn a ->
-  vec_get mem a + vec_get mem (a + 1) * 256 + vec_get mem (a + 2) * 65536 + vec_get mem (a + 3) * 16777216;
+  ldb mem a + ldb mem (a + 1) * 256 + ldb mem (a + 2) * 65536 + ldb mem (a + 3) * 16777216;
 let st32 = fn mem -> fn a -> fn v ->
-  let _ = vec_set mem a (bit_and v 255) in
-  let _ = vec_set mem (a + 1) (bit_and (bit_shr v 8) 255) in
-  let _ = vec_set mem (a + 2) (bit_and (bit_shr v 16) 255) in
-  vec_set mem (a + 3) (bit_and (bit_shr v 24) 255);
+  let _ = stb mem a v in
+  let _ = stb mem (a + 1) (bit_shr v 8) in
+  let _ = stb mem (a + 2) (bit_shr v 16) in
+  stb mem (a + 3) (bit_shr v 24);
 
 // --- register file (x0 stays 0; writes to x0 are dropped) ----------------
 let wrx = fn x -> fn i -> fn v -> if i == 0 then () else vec_set x i (mask32 v);
@@ -90,16 +108,34 @@ let out = vec_new ();
 // at QEMU virt's 0x10000000: a byte store goes to stdout as it happens, which
 // is what a shell needs and what the buffered `out` above cannot give.
 let mmio_base = 268435456;   // 0x10000000
+let mmio_len = 65536;
 // A minimal CLINT: a monotonic counter and a comparand. Both 32-bit here, where
 // the real thing is 64-bit — a 32-bit mtime is enough for a scheduler tick and
 // keeps every access a single word.
-let clint_mtime = 268468224;      // 0x10008000
-let clint_mtimecmp = 268468232;   // 0x10008008
+//
+// In virt mode the two registers move to the addresses QEMU's board uses, which
+// are 32 KB apart rather than adjacent. That is the whole difference a guest
+// sees between the two machines, aside from where RAM is.
+let clint_mtime = if virt == 1 then 33603576 else 268468224;      // 0x0200bff8 / 0x10008000
+let clint_mtimecmp = if virt == 1 then 33570816 else 268468232;   // 0x02004000 / 0x10008008
+// virt's test finisher: 0x5555 powers the machine off. A guest that wants to
+// stop has no host syscall on that board, so stopping is a device.
+let test_finisher = 1048576;      // 0x00100000
 let timer = new_vec 2 0;          // [mtime, mtimecmp]
-let mmio_store = fn addr -> fn v ->
+// Which addresses are devices, named rather than "anything above RAM": on virt
+// the devices are *below* RAM, so there is no single threshold left to compare
+// against, and an address that is neither RAM nor a device should fault rather
+// than read as zero.
+let is_device = fn a ->
+  a >= mmio_base && a < mmio_base + mmio_len
+  || a >= clint_mtimecmp && a < clint_mtimecmp + 8
+  || a >= clint_mtime && a < clint_mtime + 8
+  || a >= test_finisher && a < test_finisher + 8;
+let mmio_store = fn st -> fn addr -> fn v ->
   if addr == mmio_base then print_no_nl (chr (bit_and v 255))
   else if addr == clint_mtimecmp then vec_set timer 1 (mask32 v)
   else if addr == clint_mtime then vec_set timer 0 (mask32 v)
+  else if addr == test_finisher then vec_set st 1 1
   else ();
 
 // Receive side: one byte of lookahead, because the guest asks "is anything
@@ -157,7 +193,7 @@ let step = fn mem -> fn x -> fn st ->
   // somewhere it does not have used to take the emulator down with an "index out
   // of bounds" about the host's array. An instruction access fault (cause 1) is
   // the guest's own problem, reported in the guest's terms.
-  if pc + 3 >= vec_len mem then take_trap st 1 pc pc else
+  if in_ram mem pc == false then take_trap st 1 pc pc else
   let inst = ld32 mem pc in
   let _ = vec_set st 0 (mask32 (pc + 4)) in                // sequential next PC (branches override)
   let op = bit_and inst 127 in
@@ -188,26 +224,31 @@ let step = fn mem -> fn x -> fn st ->
     if take == 1 then vec_set st 0 (mask32 (pc + imm_b inst)) else ()
   else if op == 0x03 then                                             // loads
     let addr = mask32 (a + imm_i inst) in
-    if addr >= mmio_base then wrx x rd (mmio_load addr)               // device
-    // Past the end of RAM: the guest's mistake, so it becomes the guest's trap
-    // (load access fault). This used to take the emulator down with a Mere
+    // RAM first, then devices. Asking "is this a device?" first is only right
+    // while the devices are above RAM: on virt every RAM address is above the
+    // UART, so that test called the whole of memory a device.
+    if in_ram mem addr then
+      if f3 == 2 then wrx x rd (ld32 mem addr)                        // LW
+      else if f3 == 0 then wrx x rd (sign_ext (ldb mem addr) 8)       // LB
+      else if f3 == 4 then wrx x rd (ldb mem addr)                    // LBU
+      else if f3 == 1 then wrx x rd (sign_ext (ldb mem addr + ldb mem (mask32 (addr + 1)) * 256) 16)  // LH
+      else if f3 == 5 then wrx x rd (ldb mem addr + ldb mem (mask32 (addr + 1)) * 256)  // LHU
+      else ()
+    else if is_device addr then wrx x rd (mmio_load addr)
+    // Neither RAM nor a device: the guest's mistake, so it becomes the guest's
+    // trap (load access fault). This used to take the emulator down with a Mere
     // "index out of bounds", which reported the host's problem, not the guest's.
-    else if addr + 3 >= vec_len mem then take_trap st 5 addr pc
-    else if f3 == 2 then wrx x rd (ld32 mem addr)                     // LW
-    else if f3 == 0 then wrx x rd (sign_ext (vec_get mem addr) 8)     // LB
-    else if f3 == 4 then wrx x rd (vec_get mem addr)                  // LBU
-    else if f3 == 1 then wrx x rd (sign_ext (vec_get mem addr + vec_get mem (mask32 (addr + 1)) * 256) 16)  // LH
-    else if f3 == 5 then wrx x rd (vec_get mem addr + vec_get mem (mask32 (addr + 1)) * 256)  // LHU
-    else ()
+    else take_trap st 5 addr pc
   else if op == 0x23 then                                             // stores
     let addr = mask32 (a + imm_s inst) in
-    if addr >= mmio_base then mmio_store addr b                       // device
-    else if addr + 3 >= vec_len mem then take_trap st 7 addr pc        // store access fault
-    else if f3 == 2 then st32 mem addr b                              // SW
-    else if f3 == 0 then vec_set mem addr (bit_and b 255)             // SB
-    else if f3 == 1 then                                              // SH
-      let _ = vec_set mem addr (bit_and b 255) in vec_set mem (mask32 (addr + 1)) (bit_and (bit_shr b 8) 255)
-    else ()
+    if in_ram mem addr then
+      if f3 == 2 then st32 mem addr b                                  // SW
+      else if f3 == 0 then stb mem addr b                              // SB
+      else if f3 == 1 then                                             // SH
+        let _ = stb mem addr b in stb mem (mask32 (addr + 1)) (bit_shr b 8)
+      else ()
+    else if is_device addr then mmio_store st addr b
+    else take_trap st 7 addr pc                                       // store access fault
   else if op == 0x13 then                                             // I-type ALU
     let imm = imm_i inst in
     if f3 == 0 then wrx x rd (mask32 (a + imm))                       // ADDI
@@ -296,7 +337,7 @@ let step = fn mem -> fn x -> fn st ->
         let buf = vec_get x 11 in
         let len = vec_get x 12 in
         let rec emit = fn i ->
-          if i >= len then () else let _ = vec_push out (vec_get mem (mask32 (buf + i))) in emit (i + 1) in
+          if i >= len then () else let _ = vec_push out (ldb mem (mask32 (buf + i))) in emit (i + 1) in
         let _ = emit 0 in
         vec_set x 10 len                                             // return bytes written in a0
       else ()
@@ -351,22 +392,22 @@ let x = new_vec 32 0;
 let st = new_vec 2 0;
 let prog = read_file_bytes "prog.bin";
 let pn = vec_len prog;
-let rec load = fn i -> if i >= pn then () else let _ = vec_set mem i (vec_get prog i) in load (i + 1);
+let rec load = fn i -> if i >= pn then () else let _ = stb mem (dram_base + i) (vec_get prog i) in load (i + 1);
 let _ = load 0;
 // A second image, if there is one, at 8 MB — the bootloader's job, done by the
 // bootloader. A kernel with no filesystem has to get its first user process from
 // somewhere, and `mere -rv --load-base 8388608` builds one to live here.
-let user_base = 8388608;   // 0x800000
+let user_base = dram_base + 8388608;   // 8 MB into RAM, wherever RAM starts
 let _ =
   if file_exists "user.bin" then
     let u = read_file_bytes "user.bin" in
     let un = vec_len u in
     let rec loadu = fn i ->
-      if i >= un then () else let _ = vec_set mem (user_base + i) (vec_get u i) in loadu (i + 1) in
+      if i >= un then () else let _ = stb mem (user_base + i) (vec_get u i) in loadu (i + 1) in
     loadu 0
   else ();
-let _ = vec_set x 2 0x70000;     // sp near the top of RAM (the program also sets it)
-let _ = vec_set st 0 0;          // PC = 0 = _start
+let _ = vec_set x 2 (dram_base + 0x70000);   // sp in RAM (the program also sets it)
+let _ = vec_set st 0 dram_base;              // PC = the first byte of RAM = _start
 
 // Run until the guest halts — an exit syscall, or an instruction the core does
 // not implement. There is no instruction budget: the self-hosted Mere compiler

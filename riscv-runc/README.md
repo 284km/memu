@@ -61,8 +61,10 @@ within RV32IM — and it runs just the same.
 
 ## Devices
 
-Addresses at or above `0x10000000` are device MMIO rather than RAM, so a device
-address does not move when the RAM size does. One device so far:
+An address that is not RAM and is not one of the devices below faults (a load or
+store access fault, the guest's own problem). RAM is checked first, because in
+virt mode — see below — every RAM address is numerically above the UART, so
+"anything above 0x10000000 is a device" would call the whole of memory a device.
 
 | address | register | behaviour |
 |---------|----------|-----------|
@@ -71,6 +73,7 @@ address does not move when the RAM size does. One device so far:
 | `0x10000005` | UART line status (read) | bit 5 transmitter ready (always), bit 0 data waiting |
 | `0x10008000` | CLINT mtime | a monotonic counter, one tick per instruction |
 | `0x10008008` | CLINT mtimecmp | the deadline; reaching it raises a timer interrupt |
+| `0x00100000` | test finisher (write) | `0x5555` powers the machine off (virt's way to exit) |
 
 The receive side keeps one byte of lookahead, because a guest asks "is anything
 waiting?" before it asks "what is it?". Finding out uses Mere's `stdin_byte`,
@@ -140,9 +143,44 @@ The Mere side of this is `set_trap_handler`, which takes an ordinary closure:
 see the main repo's `examples/riscv_bare_timer.mere`, where a machine interrupts
 itself and a Mere handler services the timer while the main loop just spins.
 
+## The virt board, and why it is worth having
+
+```sh
+./rvrun 8 virt      # RAM at 0x80000000, the CLINT at QEMU virt's addresses
+```
+
+Everything here is self-written: this emulator, the compiler that feeds it, and
+the tests. So when a bare-metal program misbehaves, "is the binary wrong or is the
+emulator wrong?" has no answer from the inside — agreeing with yourself is not
+evidence.
+
+QEMU's `virt` board is an independent implementation of the same specification, and
+`virt` mode makes an image built for it run **here** as well, so the two can be
+diffed against each other. Two differences from the default layout, and that is
+all:
+
+| | default | `virt` |
+|---|---|---|
+| RAM starts at | `0` | `0x80000000` |
+| CLINT | `0x10008000` / `+8` | `0x0200bff8` (mtime), `0x02004000` (mtimecmp) |
+
+The UART is already at virt's address, and the addresses inside the core stay
+absolute exactly as the guest computes them — four accessors know where RAM
+landed, and nothing else does.
+
+The Mere repo drives both sides of the comparison:
+`MEMU=/path/to/memu sh scripts/qemu_virt.sh` builds each `riscv_virt_*` example,
+runs it on QEMU and here, and diffs the two.
+
+One honest difference remains, and it is about the clock rather than the CPU:
+`mtime` here counts **instructions**, while on virt it is a 10 MHz clock. A
+program whose output depends on how much work fits in a time slice will not match;
+one whose output depends on the number of switches will.
+
 ## Running your own
 
-The emulator takes an optional RAM size in MB (`./rvrun 20`), defaulting to 8.
-It matters for `mere -rv` output, whose stack starts at the top of RAM: see
+The emulator takes an optional RAM size in MB (`./rvrun 20`), defaulting to 8, and
+`virt` as a second argument for the board layout above. The RAM size matters for
+`mere -rv` output, whose stack starts at the top of RAM: see
 [`../riscv-mere`](../riscv-mere). There is no instruction budget — the guest
 runs until it halts, so Ctrl-C is the way out of a runaway program.

@@ -33,6 +33,13 @@ And once a program runs on a CPU you wrote, you can debug it there: the core in
 the frame layout the compiler describes, and steps **backwards** — an undo log per
 instruction, so reverse is exact rather than replayed.
 
+`riscv-runc` also speaks QEMU's `virt` board: pass `virt` as its second argument
+and RAM moves to 2GB with the CLINT at that board's addresses, so an image built
+for QEMU runs here too and the two can be diffed against each other. That matters
+because everything above is self-written — the emulator, the compiler that feeds
+it, and the tests. Agreeing with yourself is not evidence; agreeing with QEMU,
+byte for byte, is.
+
 ## Running
 
 You need the [Mere](https://github.com/merelang/mere) compiler on your `PATH`
