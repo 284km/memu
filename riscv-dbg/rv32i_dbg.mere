@@ -1,0 +1,750 @@
+// rv32i_dbg.mere — a source-level, time-travelling debugger for `mere -rv`.
+//
+//   mere -rv  prog.mere > prog.bin
+//   mere -rvg prog.mere > prog.map       # symbols, frame layout, line table
+//   ./rvdbg [ram_mb]                     # then type at it, or pipe a script
+//
+// The RV32IM core is the one from ../riscv-runc, with every state change routed
+// through an undo log. What follows is the debugger.
+//
+// It exists because every hard bug in the bare-metal work was found by
+// instrumenting that emulator by hand — a ring buffer of PCs here, a store
+// watchpoint there — and thrown away afterwards. This is that instrumentation,
+// kept, and pointed at source lines instead of addresses.
+//
+// `mere -rvg` is the other half. The binary has no header to hold debug info, so
+// the map is a text sidecar; the compiler emits it from the same item list it
+// assembles, so `-rv` and `-rvg` agree by construction and the map describes the
+// bytes you actually ran.
+
+let mask32 = fn x -> bit_and x 4294967295;                 // 0xFFFFFFFF
+// interpret a 32-bit value as signed two's complement
+let signed32 = fn x ->
+  let m = mask32 x in
+  if bit_and m 2147483648 == 0 then m else m - 4294967296; // 0x80000000 / 2^32
+// sign-extend a `bits`-wide value already confined to `bits` bits
+let sign_ext = fn v -> fn bits ->
+  let half = bit_shl 1 (bits - 1) in
+  if bit_and v half == 0 then v else v - bit_shl 1 bits;
+// arithmetic right shift of a 32-bit value by s (0..31)
+let sra32 = fn v -> fn s ->
+  let m = mask32 v in
+  let r = bit_shr m s in
+  if bit_and m 2147483648 == 0 || s == 0 then mask32 r
+  else mask32 (bit_or r (bit_shl 4294967295 (32 - s)));
+
+let new_vec = fn n -> fn x ->
+  let v = vec_new () in
+  let rec go = fn i -> if i >= n then () else let _ = vec_push v x in go (i + 1) in
+  let _ = go 0 in v;
+
+
+// --- the undo log ---------------------------------------------------------
+// One fixed-size record per instruction, in a ring buffer. Stepping backwards is
+// not replay from a snapshot: it is applying the inverse of the last
+// instruction, which is exact and costs one record.
+//
+// An RV32I instruction changes at most one register and writes at most four
+// bytes; a trap also writes a handful of CSRs. So a record holds the PC it ran
+// at, the register it wrote with that register's previous value, and up to six
+// (place, previous value) pairs — where a *negative* place means a CSR index
+// rather than an address, which lets one record cover both kinds of state.
+//
+// If a step ever exceeds six places the record is poisoned rather than
+// truncated, and undo refuses to cross it. A debugger that lies about the past
+// is worse than one that admits a wall.
+let pair_cap = 6;
+let rec_words = 4 + pair_cap * 2;
+let hist_cap = 200000;
+let hist = new_vec (rec_words * hist_cap) 0;
+let hist_n = new_vec 1 0;
+let pend = new_vec rec_words 0;
+
+let pend_reset = fn () ->
+  let rec go = fn (i: int) -> if i >= rec_words then () else
+    let _ = vec_set pend i 0 in go (i + 1) in
+  let _ = go 0 in
+  vec_set pend 1 (0 - 1);
+
+let note_place = fn (place: int) -> fn (old: int) ->
+  let n = vec_get pend 3 in
+  if n >= pair_cap then vec_set pend 2 (0 - 999)          // poison
+  else
+    let _ = vec_set pend (4 + n * 2) place in
+    let _ = vec_set pend (5 + n * 2) old in
+    vec_set pend 3 (n + 1);
+
+let note_byte = fn (addr: int) -> fn (old: int) -> note_place addr old;
+let note_csr = fn (i: int) -> fn (old: int) -> note_place (0 - (i + 1)) old;
+let note_reg = fn (i: int) -> fn (old: int) ->
+  if vec_get pend 1 < 0 then
+    let _ = vec_set pend 1 i in vec_set pend 2 old
+  else note_place (0 - 5000 - i) old;                     // a second register
+// --- little-endian byte memory ------------------------------------------
+let ld32 = fn mem -> fn a ->
+  vec_get mem a + vec_get mem (a + 1) * 256 + vec_get mem (a + 2) * 65536 + vec_get mem (a + 3) * 16777216;
+let put_byte = fn mem -> fn a -> fn v ->
+  let _ = note_byte a (vec_get mem a) in
+  vec_set mem a (bit_and v 255);
+let st32 = fn mem -> fn a -> fn v ->
+  let _ = put_byte mem a v in
+  let _ = put_byte mem (a + 1) (bit_shr v 8) in
+  let _ = put_byte mem (a + 2) (bit_shr v 16) in
+  put_byte mem (a + 3) (bit_shr v 24);
+
+// --- register file (x0 stays 0; writes to x0 are dropped) ----------------
+let wrx = fn x -> fn i -> fn v ->
+  if i == 0 then ()
+  else
+    let _ = note_reg i (vec_get x i) in
+    vec_set x i (mask32 v);
+
+// unsigned 32x32 -> high 32 bits of the 64-bit product. Schoolbook over 16-bit
+// halves so every intermediate stays < 2^32 (safe on the 63-bit interpreter and
+// on the i64 native backends alike). gcc lowers `/`/`%` by a constant to a
+// MULHU by the reciprocal, so real -O2 output needs this.
+let mulhu32 = fn a -> fn b ->
+  let al = bit_and a 65535 in let ah = bit_shr (mask32 a) 16 in
+  let bl = bit_and b 65535 in let bh = bit_shr (mask32 b) 16 in
+  let ll = al * bl in
+  let lh = al * bh in
+  let hl = ah * bl in
+  let hh = ah * bh in
+  let mid = bit_shr ll 16 + bit_and lh 65535 + bit_and hl 65535 in
+  mask32 (hh + bit_shr lh 16 + bit_shr hl 16 + bit_shr mid 16);
+
+// --- immediate decoders (mirror the asm_* encoders below) ----------------
+let imm_i = fn inst -> sign_ext (bit_and (bit_shr inst 20) 4095) 12;
+let imm_s = fn inst ->
+  sign_ext (bit_or (bit_shl (bit_and (bit_shr inst 25) 127) 5) (bit_and (bit_shr inst 7) 31)) 12;
+let imm_b = fn inst ->
+  let b12 = bit_and (bit_shr inst 31) 1 in
+  let b11 = bit_and (bit_shr inst 7) 1 in
+  let b10_5 = bit_and (bit_shr inst 25) 63 in
+  let b4_1 = bit_and (bit_shr inst 8) 15 in
+  sign_ext (bit_or (bit_shl b12 12) (bit_or (bit_shl b11 11) (bit_or (bit_shl b10_5 5) (bit_shl b4_1 1)))) 13;
+let imm_u = fn inst -> bit_and inst 4294963200;            // 0xFFFFF000
+let imm_j = fn inst ->
+  let b20 = bit_and (bit_shr inst 31) 1 in
+  let b19_12 = bit_and (bit_shr inst 12) 255 in
+  let b11 = bit_and (bit_shr inst 20) 1 in
+  let b10_1 = bit_and (bit_shr inst 21) 1023 in
+  sign_ext (bit_or (bit_shl b20 20) (bit_or (bit_shl b19_12 12) (bit_or (bit_shl b11 11) (bit_shl b10_1 1)))) 21;
+
+// --- decode + execute one instruction ------------------------------------
+// st: [PC, HALT]
+// stdout buffer, filled by the ecall write(2) syscall
+let out = vec_new ();
+
+// --- device MMIO ----------------------------------------------------------
+// Devices live above any RAM, so a device address does not move when the RAM
+// size does and a guest can name one as a literal. The UART data register is
+// at QEMU virt's 0x10000000: a byte store goes to stdout as it happens, which
+// is what a shell needs and what the buffered `out` above cannot give.
+let mmio_base = 268435456;   // 0x10000000
+// A minimal CLINT: a monotonic counter and a comparand. Both 32-bit here, where
+// the real thing is 64-bit — a 32-bit mtime is enough for a scheduler tick and
+// keeps every access a single word.
+let clint_mtime = 268468224;      // 0x10008000
+let clint_mtimecmp = 268468232;   // 0x10008008
+let timer = new_vec 2 0;          // [mtime, mtimecmp]
+let mmio_store = fn addr -> fn v ->
+  if addr == mmio_base then print_no_nl (chr (bit_and v 255))
+  else if addr == clint_mtimecmp then vec_set timer 1 (mask32 v)
+  else if addr == clint_mtime then vec_set timer 0 (mask32 v)
+  else ();
+
+// Receive side: one byte of lookahead, because the guest asks "is anything
+// waiting?" before it asks "what is it?". `stdin_byte` polls without blocking
+// (read_key would stop the machine dead until a key arrived, which is no use
+// to a CPU that also has timers to service).
+// No receive side: stdin belongs to the operator, not the guest. A guest polling
+// the UART sees an empty line forever, which is the truth under a debugger that
+// holds the terminal.
+let rx = new_vec 1 (0 - 1);
+let rx_poll = fn () -> ();
+// 16550 line status: bit 5 = transmitter empty (always), bit 0 = data ready.
+let mmio_load = fn addr ->
+  if addr == clint_mtime then vec_get timer 0
+  else if addr == clint_mtimecmp then vec_get timer 1
+  else if addr == mmio_base + 5 then
+    let _ = rx_poll () in
+    if vec_get rx 0 >= 0 then 97 else 96
+  else if addr == mmio_base then
+    let _ = rx_poll () in
+    let b = vec_get rx 0 in
+    if b < 0 then 0 else let _ = vec_set rx 0 (0 - 1) in b
+  else 0;
+
+// --- machine CSRs ---------------------------------------------------------
+// 4096 slots, one per CSR number, so csrrw/csrrs/csrrc need no lookup table.
+// Only machine mode exists here: mtvec / mepc / mcause / mstatus / mie / mip /
+// mscratch are just numbers until traps arrive, and `mret` reads mepc.
+let csr = new_vec 4096 0;
+let set_csr = fn (i: int) -> fn (v: int) ->
+  let _ = note_csr i (vec_get csr i) in
+  vec_set csr i v;
+let csr_mstatus = 768;   // 0x300
+let csr_mtvec = 773;     // 0x305
+let csr_mepc = 833;      // 0x341
+let csr_mcause = 834;    // 0x342
+let csr_mtval = 835;     // 0x343
+
+// Take a trap: park the faulting PC in mepc, the reason in mcause, the offending
+// value in mtval, move MIE into MPIE (so mret can put it back), and vector to
+// mtvec. Direct mode only — the low two bits of mtvec select vectored mode,
+// which nothing here needs, so they are masked off.
+// A guest with mtvec still zero has nowhere to go: that halts, as it did before
+// traps existed, rather than jumping to address 0 and corrupting itself.
+let take_trap = fn st -> fn cause -> fn tval -> fn pc ->
+  let tvec = vec_get csr csr_mtvec in
+  if tvec == 0 then vec_set st 1 1
+  else
+    let ms = vec_get csr csr_mstatus in
+    let mie = bit_and (bit_shr ms 3) 1 in
+    let _ = set_csr csr_mstatus
+              (bit_or (bit_and ms 4294967175) (bit_shl mie 7)) in  // MIE=0, MPIE=MIE
+    let _ = set_csr csr_mepc (mask32 pc) in
+    let _ = set_csr csr_mcause (mask32 cause) in
+    let _ = set_csr csr_mtval (mask32 tval) in
+    vec_set st 0 (bit_and tvec 4294967292);
+let step = fn mem -> fn x -> fn st ->
+  let pc = vec_get st 0 in
+  // The fetch needs the same guard the loads and stores have: a guest that jumps
+  // somewhere it does not have used to take the emulator down with an "index out
+  // of bounds" about the host's array. An instruction access fault (cause 1) is
+  // the guest's own problem, reported in the guest's terms.
+  if pc + 3 >= vec_len mem then take_trap st 1 pc pc else
+  let inst = ld32 mem pc in
+  let _ = vec_set st 0 (mask32 (pc + 4)) in                // sequential next PC (branches override)
+  let op = bit_and inst 127 in
+  let rd = bit_and (bit_shr inst 7) 31 in
+  let f3 = bit_and (bit_shr inst 12) 7 in
+  let rs1 = bit_and (bit_shr inst 15) 31 in
+  let rs2 = bit_and (bit_shr inst 20) 31 in
+  let f7 = bit_and (bit_shr inst 25) 127 in
+  let a = vec_get x rs1 in
+  let b = vec_get x rs2 in
+  if op == 0x37 then wrx x rd (imm_u inst)                              // LUI
+  else if op == 0x17 then wrx x rd (mask32 (pc + imm_u inst))           // AUIPC
+  else if op == 0x6F then                                              // JAL
+    let _ = wrx x rd (mask32 (pc + 4)) in
+    vec_set st 0 (mask32 (pc + imm_j inst))
+  else if op == 0x67 then                                             // JALR
+    let t = bit_and (mask32 (a + imm_i inst)) 4294967294 in            // clear bit 0
+    let _ = wrx x rd (mask32 (pc + 4)) in
+    vec_set st 0 t
+  else if op == 0x63 then                                             // branches
+    let take =
+      if f3 == 0 then (if a == b then 1 else 0)                        // BEQ
+      else if f3 == 1 then (if a == b then 0 else 1)                   // BNE
+      else if f3 == 4 then (if signed32 a < signed32 b then 1 else 0)  // BLT
+      else if f3 == 5 then (if signed32 a >= signed32 b then 1 else 0) // BGE
+      else if f3 == 6 then (if mask32 a < mask32 b then 1 else 0)      // BLTU
+      else (if mask32 a >= mask32 b then 1 else 0) in                  // BGEU
+    if take == 1 then vec_set st 0 (mask32 (pc + imm_b inst)) else ()
+  else if op == 0x03 then                                             // loads
+    let addr = mask32 (a + imm_i inst) in
+    if addr >= mmio_base then wrx x rd (mmio_load addr)               // device
+    // Past the end of RAM: the guest's mistake, so it becomes the guest's trap
+    // (load access fault). This used to take the emulator down with a Mere
+    // "index out of bounds", which reported the host's problem, not the guest's.
+    else if addr + 3 >= vec_len mem then take_trap st 5 addr pc
+    else if f3 == 2 then wrx x rd (ld32 mem addr)                     // LW
+    else if f3 == 0 then wrx x rd (sign_ext (vec_get mem addr) 8)     // LB
+    else if f3 == 4 then wrx x rd (vec_get mem addr)                  // LBU
+    else if f3 == 1 then wrx x rd (sign_ext (vec_get mem addr + vec_get mem (mask32 (addr + 1)) * 256) 16)  // LH
+    else if f3 == 5 then wrx x rd (vec_get mem addr + vec_get mem (mask32 (addr + 1)) * 256)  // LHU
+    else ()
+  else if op == 0x23 then                                             // stores
+    let addr = mask32 (a + imm_s inst) in
+    if addr >= mmio_base then mmio_store addr b                       // device
+    else if addr + 3 >= vec_len mem then take_trap st 7 addr pc        // store access fault
+    else if f3 == 2 then st32 mem addr b                              // SW
+    else if f3 == 0 then vec_set mem addr (bit_and b 255)             // SB
+    else if f3 == 1 then                                              // SH
+      let _ = vec_set mem addr (bit_and b 255) in vec_set mem (mask32 (addr + 1)) (bit_and (bit_shr b 8) 255)
+    else ()
+  else if op == 0x13 then                                             // I-type ALU
+    let imm = imm_i inst in
+    if f3 == 0 then wrx x rd (mask32 (a + imm))                       // ADDI
+    else if f3 == 2 then wrx x rd (if signed32 a < imm then 1 else 0) // SLTI
+    else if f3 == 3 then wrx x rd (if mask32 a < mask32 imm then 1 else 0)  // SLTIU
+    else if f3 == 4 then wrx x rd (bit_xor a imm)                     // XORI
+    else if f3 == 6 then wrx x rd (bit_or a imm)                      // ORI
+    else if f3 == 7 then wrx x rd (bit_and a imm)                     // ANDI
+    else if f3 == 1 then wrx x rd (mask32 (bit_shl a (bit_and rs2 31)))     // SLLI
+    else if f7 == 0 then wrx x rd (bit_shr (mask32 a) (bit_and rs2 31))     // SRLI
+    else wrx x rd (sra32 a (bit_and rs2 31))                          // SRAI
+  else if op == 0x33 && f7 == 1 then                                  // RV32M (mul/div/rem)
+    (if f3 == 0 then wrx x rd (mask32 (a * b))                        // MUL (low 32)
+     else if f3 == 3 then wrx x rd (mulhu32 a b)                      // MULHU
+     else if f3 == 1 then                                            // MULH (signed x signed)
+       let uu = mulhu32 a b in
+       let an = bit_shr (mask32 a) 31 in let bn = bit_shr (mask32 b) 31 in
+       wrx x rd (mask32 (uu - (if an == 1 then mask32 b else 0) - (if bn == 1 then mask32 a else 0)))
+     else if f3 == 2 then                                            // MULHSU (signed x unsigned)
+       let uu = mulhu32 a b in
+       let an = bit_shr (mask32 a) 31 in
+       wrx x rd (mask32 (uu - (if an == 1 then mask32 b else 0)))
+     else if f3 == 4 then                                            // DIV (signed)
+       let sa = signed32 a in let sb = signed32 b in
+       if sb == 0 then wrx x rd 4294967295
+       else if sa == (0 - 2147483648) && sb == (0 - 1) then wrx x rd 2147483648
+       else wrx x rd (mask32 (sa / sb))
+     else if f3 == 5 then                                            // DIVU (unsigned)
+       let bu = mask32 b in
+       if bu == 0 then wrx x rd 4294967295 else wrx x rd (mask32 (mask32 a / bu))
+     else if f3 == 6 then                                            // REM (signed)
+       let sa = signed32 a in let sb = signed32 b in
+       if sb == 0 then wrx x rd (mask32 sa)
+       else if sa == (0 - 2147483648) && sb == (0 - 1) then wrx x rd 0
+       else wrx x rd (mask32 (sa - (sa / sb) * sb))
+     else if f3 == 7 then                                            // REMU (unsigned)
+       let au = mask32 a in let bu = mask32 b in
+       if bu == 0 then wrx x rd au else wrx x rd (mask32 (au - (au / bu) * bu))
+     else vec_set st 1 1)                                            // MULH/MULHSU/MULHU: not implemented
+  else if op == 0x33 then                                             // R-type ALU (base)
+    let sh = bit_and b 31 in
+    if f3 == 0 then (if f7 == 0 then wrx x rd (mask32 (a + b)) else wrx x rd (mask32 (a - b)))  // ADD/SUB
+    else if f3 == 1 then wrx x rd (mask32 (bit_shl a sh))             // SLL
+    else if f3 == 2 then wrx x rd (if signed32 a < signed32 b then 1 else 0)  // SLT
+    else if f3 == 3 then wrx x rd (if mask32 a < mask32 b then 1 else 0)      // SLTU
+    else if f3 == 4 then wrx x rd (bit_xor a b)                       // XOR
+    else if f3 == 5 then (if f7 == 0 then wrx x rd (bit_shr (mask32 a) sh) else wrx x rd (sra32 a sh))  // SRL/SRA
+    else if f3 == 6 then wrx x rd (bit_or a b)                        // OR
+    else wrx x rd (bit_and a b)                                       // AND
+  else if op == 0x73 then                                            // SYSTEM
+    let csr_n = bit_and (bit_shr inst 20) 4095 in
+    if f3 == 1 || f3 == 2 || f3 == 3 then                            // CSRRW / CSRRS / CSRRC
+      let old = vec_get csr csr_n in
+      let _ = wrx x rd old in
+      let v = if f3 == 1 then mask32 a
+              else if f3 == 2 then bit_or old a
+              else bit_and old (bit_and (bit_not a) 4294967295) in
+      set_csr csr_n (mask32 v)
+    else if f3 == 5 || f3 == 6 || f3 == 7 then                       // the -I forms (rs1 = imm)
+      let old = vec_get csr csr_n in
+      let _ = wrx x rd old in
+      let v = if f3 == 5 then rs1
+              else if f3 == 6 then bit_or old rs1
+              else bit_and old (bit_and (bit_not rs1) 4294967295) in
+      set_csr csr_n (mask32 v)
+    else if csr_n == 770 then                                        // MRET (0x302)
+      // return to mepc, and restore the interrupt-enable bit MPIE -> MIE
+      let ms = vec_get csr csr_mstatus in
+      let mpie = bit_and (bit_shr ms 7) 1 in
+      let ms2 = bit_or (bit_and ms 4294967287) (bit_shl mpie 3) in   // clear MIE, set from MPIE
+      let _ = set_csr csr_mstatus (bit_or ms2 128) in            // MPIE = 1
+      vec_set st 0 (mask32 (vec_get csr csr_mepc))
+    else if csr_n == 261 then ()                                     // WFI (0x105) -> nop
+    else if vec_get csr csr_mtvec != 0 then
+      // A kernel is installed, so an environment call is the guest's business:
+      // cause 11, vectored like any other trap. That is what makes a syscall
+      // boundary possible — the user process asks, the kernel answers, and the
+      // emulator is not in the conversation. With no kernel (mtvec still zero)
+      // the tiny host ABI below stands in, which is what every non-bare program
+      // on this emulator has always used.
+      take_trap st 11 0 pc
+    else                                                             // ECALL / EBREAK
+      let a7 = vec_get x 17 in                                       // syscall number
+      if a7 == 93 then vec_set st 1 1                                // exit -> halt
+      else if a7 == 64 then                                          // write(fd, buf, len)
+        let buf = vec_get x 11 in
+        let len = vec_get x 12 in
+        let rec emit = fn i ->
+          if i >= len then () else let _ = vec_push out (vec_get mem (mask32 (buf + i))) in emit (i + 1) in
+        let _ = emit 0 in
+        vec_set x 10 len                                             // return bytes written in a0
+      else ()
+  else if op == 0x0F then ()                                          // FENCE -> nop
+  else take_trap st 2 inst pc;                                        // illegal instruction
+
+let rec run = fn mem -> fn x -> fn st -> fn budget ->
+  if budget <= 0 then ()
+  else if vec_get st 1 == 1 then ()
+  else let _ = step mem x st in run mem x st (budget - 1);
+
+// --- the debug map --------------------------------------------------------
+// One record per line, addresses ascending (see `mere -rvg`):
+//   S <addr> <name>                              every label
+//   F <addr> <name> fsz= ra= fp= params= line=    a function and its frame
+//   L <addr> <line> <col>                         the statement starting here
+// Parallel vecs rather than records, so a lookup is a scan over ints.
+
+let sym_a = vec_new ();
+let sym_n = vec_new ();
+let fn_a = vec_new ();
+let fn_n = vec_new ();
+let fn_fsz = vec_new ();
+let fn_ra = vec_new ();
+let fn_fp = vec_new ();
+let ln_a = vec_new ();
+let ln_l = vec_new ();
+
+// "fsz=28" -> 28
+let after_eq = fn (s: str) ->
+  let i = str_index_of s "=" in
+  if i < 0 then 0 else int_of_str (substring s (i + 1) (str_len s));
+
+let nth_word = fn (ws) -> fn (k: int) ->
+  let rec go = fn (l) -> fn (i: int) ->
+    match l with
+    | Nil -> ""
+    | Cons (h, t) -> if i >= k then h else go t (i + 1) in
+  go ws 0;
+
+let load_map = fn (path: str) ->
+  let text = read_file path in
+  let rec each = fn (ls) ->
+    match ls with
+    | Nil -> ()
+    | Cons (line, rest) ->
+      let ws = str_split line " " in
+      let k = nth_word ws 0 in
+      let _ =
+        if k == "S" then
+          let _ = vec_push sym_a (int_of_str (nth_word ws 1)) in
+          vec_push sym_n (nth_word ws 2)
+        else if k == "F" then
+          let _ = vec_push fn_a (int_of_str (nth_word ws 1)) in
+          let _ = vec_push fn_n (nth_word ws 2) in
+          let _ = vec_push fn_fsz (after_eq (nth_word ws 3)) in
+          let _ = vec_push fn_ra (after_eq (nth_word ws 4)) in
+          vec_push fn_fp (after_eq (nth_word ws 5))
+        else if k == "L" then
+          let _ = vec_push ln_a (int_of_str (nth_word ws 1)) in
+          vec_push ln_l (int_of_str (nth_word ws 2))
+        else () in
+      each rest in
+  each (str_split text "\n");
+
+// the last record at or before pc, or -1
+let last_at = fn (addrs) -> fn (pc: int) ->
+  let rec go = fn (i: int) -> fn (best: int) ->
+    if i >= vec_len addrs then best
+    else if vec_get addrs i <= pc then go (i + 1) i
+    else best in
+  go 0 (0 - 1);
+
+let hex_digit = fn (v: int) ->
+  if v < 10 then chr (48 + v) else chr (87 + v);
+let to_hex = fn (v: int) ->
+  let rec go = fn (n: int) -> fn (acc: str) ->
+    if n == 0 then acc else go (n / 16) (hex_digit (n % 16) ++ acc) in
+  if v == 0 then "0x0" else "0x" ++ go v "";
+
+let sym_for = fn (pc: int) ->
+  let i = last_at sym_a pc in
+  if i < 0 then "?" else vec_get sym_n i;
+
+let fn_for = fn (pc: int) ->
+  let i = last_at fn_a pc in
+  let f = if i < 0 then "" else vec_get fn_n i in
+  // runtime helpers and _start have labels but no frame record; name them anyway
+  if str_len f == 0 then sym_for pc else f;
+
+// A line record describes a pc only if it sits inside the same function.
+// Without that check the last record of the previous function leaks across the
+// boundary, and a step into a callee reports the caller's neighbour's line.
+let line_for = fn (pc: int) ->
+  let i = last_at ln_a pc in
+  if i < 0 then 0
+  else
+    let f = last_at fn_a pc in
+    let fa = if f < 0 then 0 else vec_get fn_a f in
+    if vec_get ln_a i < fa then 0 else vec_get ln_l i;
+
+// the first address whose statement is on this source line
+let addr_of_line = fn (n: int) ->
+  let rec go = fn (i: int) ->
+    if i >= vec_len ln_a then 0 - 1
+    else if vec_get ln_l i == n then vec_get ln_a i
+    else go (i + 1) in
+  go 0;
+
+// --- source, for showing the line you are on ------------------------------
+let src_lines = vec_new ();
+let load_src = fn (path: str) ->
+  if file_exists path then
+    let rec each = fn (ls) ->
+      match ls with
+      | Nil -> ()
+      | Cons (h, t) -> let _ = vec_push src_lines h in each t in
+    each (str_split (read_file path) "\n")
+  else ();
+let src_line = fn (n: int) ->
+  if n >= 1 && n <= vec_len src_lines then vec_get src_lines (n - 1) else "";
+
+// --- the machine ----------------------------------------------------------
+let ram_mb = match args () with
+  | Cons (a, _) -> int_of_str a
+  | Nil -> 8;
+let mem = new_vec (ram_mb * 1048576) 0;
+let x = new_vec 32 0;
+let st = new_vec 2 0;
+let steps = new_vec 1 0;                      // instructions retired
+
+let load_image = fn (path: str) -> fn (base: int) ->
+  if file_exists path then
+    let b = read_file_bytes path in
+    let n = vec_len b in
+    let rec go = fn (i: int) ->
+      if i >= n then () else let _ = vec_set mem (base + i) (vec_get b i) in go (i + 1) in
+    go 0
+  else ();
+
+// mtime advances once per instruction, and a timer interrupt is taken between
+// instructions — the same rule the plain emulator follows, so a program debugged
+// here is preempted where it would be preempted there.
+let csr_mie = 772;       // 0x304, bit 7 = MTIE
+let csr_mip = 836;       // 0x344, bit 7 = MTIP
+let timer_pending = fn () ->
+  let armed = vec_get timer 1 in
+  if armed == 0 then 0
+  else if vec_get timer 0 < armed then 0
+  else if bit_and (bit_shr (vec_get csr csr_mstatus) 3) 1 == 0 then 0
+  else if bit_and (bit_shr (vec_get csr csr_mie) 7) 1 == 0 then 0
+  else 1;
+
+// --- breakpoints ----------------------------------------------------------
+let bps = vec_new ();
+let is_bp = fn (pc: int) ->
+  let rec go = fn (i: int) ->
+    if i >= vec_len bps then 0
+    else if vec_get bps i == pc then 1
+    else go (i + 1) in
+  go 0;
+
+// --- time travel ----------------------------------------------------------
+
+// Commit the record the last instruction built. The PC stored is the one it ran
+// at, so undoing restores where we were, not where we were going.
+let hist_commit = fn (pc: int) ->
+  let base = (vec_get hist_n 0 % hist_cap) * rec_words in
+  let _ = vec_set hist base pc in
+  let rec go = fn (i: int) -> if i >= rec_words then () else
+    let _ = vec_set hist (base + i) (vec_get pend i) in go (i + 1) in
+  let _ = go 1 in
+  vec_set hist_n 0 (vec_get hist_n 0 + 1);
+
+// Apply one record backwards: put every place back, then the register, then the
+// PC. The sets are disjoint by construction, so order does not matter.
+let undo1 = fn () ->
+  let n = vec_get hist_n 0 in
+  if n <= 0 then 0
+  else
+    let base = ((n - 1) % hist_cap) * rec_words in
+    let pc = vec_get hist base in
+    let rd = vec_get hist (base + 1) in
+    let old = vec_get hist (base + 2) in
+    let nb = vec_get hist (base + 3) in
+    if old == 0 - 999 then
+      let _ = print "  (that instruction changed more state than one record holds — cannot step back past it)" in 0
+    else
+      let rec restore = fn (i: int) ->
+        if i >= nb then ()
+        else
+          let place = vec_get hist (base + 4 + i * 2) in
+          let v = vec_get hist (base + 5 + i * 2) in
+          let _ =
+            if place >= 0 then vec_set mem place v
+            else if place <= 0 - 5000 then vec_set x (0 - 5000 - place) v
+            else vec_set csr (0 - place - 1) v in
+          restore (i + 1) in
+      let _ = restore 0 in
+      let _ = if rd > 0 then vec_set x rd old else () in
+      let _ = vec_set st 0 pc in
+      let _ = vec_set st 1 0 in            // a halted machine can still step back
+      let _ = vec_set hist_n 0 (n - 1) in
+      let _ = vec_set steps 0 (vec_get steps 0 - 1) in
+      1;
+
+// --- stepping -------------------------------------------------------------
+// One instruction, counting it. Halt is sticky.
+let step1 = fn () ->
+  if vec_get st 1 == 1 then 0
+  else
+    let pc0 = vec_get st 0 in
+    let _ = pend_reset () in
+    let _ = vec_set timer 0 (mask32 (vec_get timer 0 + 1)) in
+    let _ =
+      if timer_pending () == 1 then
+        let _ = set_csr csr_mip (bit_or (vec_get csr csr_mip) 128) in
+        take_trap st 2147483655 0 (vec_get st 0)
+      else () in
+    if vec_get st 1 == 1 then 0
+    else
+      let _ = step mem x st in
+      let _ = hist_commit pc0 in
+      let _ = vec_set steps 0 (vec_get steps 0 + 1) in
+      1;
+
+// Run until a breakpoint, a halt, or the budget runs out. Returns 1 if it
+// stopped at a breakpoint.
+let rec run_to_bp = fn (budget: int) ->
+  if budget <= 0 then 0
+  else if step1 () == 0 then 0
+  else if is_bp (vec_get st 0) == 1 then 1
+  else run_to_bp (budget - 1);
+
+// One source line: advance until the line reported for the PC changes, so a
+// step is a step in the program the person wrote rather than in its encoding.
+// A step lands on the next *statement*. Addresses with no line record — a
+// prologue, a runtime helper — are passed through rather than stopped at, or
+// stepping into a function would stop on its frame setup and report nothing.
+let rec run_line = fn (from: int) -> fn (budget: int) ->
+  if budget <= 0 then 0
+  else if step1 () == 0 then 0
+  else if is_bp (vec_get st 0) == 1 then 1
+  else
+    let l = line_for (vec_get st 0) in
+    if l > 0 && l != from then 0
+    else run_line from (budget - 1);
+
+// --- reporting ------------------------------------------------------------
+let regname = fn (i: int) ->
+  if i == 1 then "ra" else if i == 2 then "sp" else if i == 3 then "gp"
+  else if i == 8 then "fp" else if i == 10 then "a0" else if i == 11 then "a1"
+  else if i == 5 then "t0" else if i == 6 then "t1" else if i == 9 then "s1"
+  else "x" ++ str_of_int i;
+
+let where = fn () ->
+  let pc = vec_get st 0 in
+  let n = line_for pc in
+  let _ = print ("pc " ++ to_hex pc ++ "  " ++ fn_for pc
+                 ++ "  line " ++ str_of_int n ++ "  [" ++ sym_for pc ++ "]") in
+  let s = src_line n in
+  if str_len s > 0 then print ("  " ++ str_of_int n ++ " | " ++ s) else ();
+
+let show_regs = fn () ->
+  let rec go = fn (i: int) ->
+    if i > 17 then ()
+    else
+      let _ = print_no_nl (regname i ++ "=" ++ str_of_int (vec_get x i) ++ " ") in
+      go (i + 1) in
+  let _ = go 1 in
+  print "";
+
+// A backtrace, using the frame layout the map records: ra and fp live at fixed
+// offsets from fp, so one load each walks to the caller. At a function's first
+// instructions fp still belongs to the caller, so the innermost frame can be
+// attributed one level up — the honest cost of not tracking prologue state.
+let backtrace = fn () ->
+  let rec go = fn (pc: int) -> fn (fp: int) -> fn (depth: int) ->
+    if depth > 12 then ()
+    else
+      let _ = print ("  #" ++ str_of_int depth ++ " " ++ fn_for pc
+                     ++ " line " ++ str_of_int (line_for pc)
+                     ++ "  (pc " ++ to_hex pc ++ ")") in
+      let i = last_at fn_a pc in
+      if i < 0 then ()
+      else
+        let ra_off = vec_get fn_ra i in
+        let fp_off = vec_get fn_fp i in
+        if fp <= 0 || fp + ra_off + 3 >= vec_len mem then ()
+        else
+          let ra = ld32 mem (fp + ra_off) in
+          let up = ld32 mem (fp + fp_off) in
+          if ra == 0 then () else go ra up (depth + 1) in
+  go (vec_get st 0) (vec_get x 8) 0;
+
+// Backwards by one source line: undo until the reported line changes.
+let rec undo_line = fn (from: int) -> fn (budget: int) ->
+  if budget <= 0 then 0
+  else if undo1 () == 0 then 0
+  else
+    let l = line_for (vec_get st 0) in
+    if l > 0 && l != from then 1
+    else undo_line from (budget - 1);
+
+// --- the command loop -----------------------------------------------------
+let arg_of = fn (line: str) ->
+  let i = str_index_of line " " in
+  if i < 0 then "" else str_trim (substring line (i + 1) (str_len line));
+
+let help = fn () ->
+  let _ = print "  b <line>   breakpoint at a source line     bl        list breakpoints" in
+  let _ = print "  r          run to a breakpoint or the end   c         continue" in
+  let _ = print "  s          step one source line             i         step one instruction" in
+  let _ = print "  S          step back one source line        I         step back one instruction" in
+  let _ = print "  w          where am I                       bt        backtrace" in
+  let _ = print "  p          registers                        x <addr>  read a word" in
+  let _ = print "  n          instructions retired             k <addr>  checksum 4KB" in
+  let _ = print "  q          quit" in
+  print "  Stepping back applies the inverse of each instruction, so it is exact.";
+
+let budget = 200000000;
+
+let rec repl = fn () ->
+  let _ = print_no_nl "(rvdbg) " in
+  let line = str_trim (read_line ()) in
+  let cmd = if str_len line == 0 then "" else nth_word (str_split line " ") 0 in
+  if cmd == "q" then ()
+  else
+    let _ =
+      if cmd == "" then ()
+      else if cmd == "h" then help ()
+      else if cmd == "b" then
+        let n = int_of_str (arg_of line) in
+        let a = addr_of_line n in
+        if a < 0 then print ("  no code on line " ++ str_of_int n)
+        else
+          let _ = vec_push bps a in
+          print ("  breakpoint at line " ++ str_of_int n ++ " (" ++ to_hex a ++ ")")
+      else if cmd == "bl" then
+        let rec go = fn (i: int) ->
+          if i >= vec_len bps then () else
+            let a = vec_get bps i in
+            let _ = print ("  " ++ str_of_int i ++ ": line " ++ str_of_int (line_for a)
+                           ++ " (" ++ to_hex a ++ ")") in
+            go (i + 1) in
+        go 0
+      else if cmd == "r" || cmd == "c" then
+        let hit = run_to_bp budget in
+        if hit == 1 then where ()
+        else if vec_get st 1 == 1 then print ("  halted after " ++ str_of_int (vec_get steps 0) ++ " instructions")
+        else print "  budget exhausted"
+      else if cmd == "s" then
+        let _ = run_line (line_for (vec_get st 0)) budget in where ()
+      else if cmd == "i" then
+        let _ = step1 () in where ()
+      else if cmd == "S" then
+        let moved = undo_line (line_for (vec_get st 0)) budget in
+        if moved == 1 then where () else print "  no further history"
+      else if cmd == "I" then
+        let moved = undo1 () in
+        if moved == 1 then where () else print "  no further history"
+      else if cmd == "w" then where ()
+      else if cmd == "bt" then backtrace ()
+      else if cmd == "p" then show_regs ()
+      else if cmd == "n" then print ("  " ++ str_of_int (vec_get steps 0) ++ " instructions retired")
+      else if cmd == "k" then
+        // a checksum over 4KB, which is how you ask "did anything in here move?"
+        // — and how reverse stepping gets tested: the number must come back.
+        let a = int_of_str (arg_of line) in
+        if a < 0 || a + 4096 >= vec_len mem then print "  outside RAM"
+        else
+          let rec go = fn (i: int) -> fn (acc: int) ->
+            if i >= 4096 then acc
+            else go (i + 4) (mask32 (acc * 31 + ld32 mem (a + i))) in
+          print ("  sum[" ++ to_hex a ++ " +4k] = " ++ str_of_int (go 0 0))
+      else if cmd == "x" then
+        let a = int_of_str (arg_of line) in
+        if a < 0 || a + 3 >= vec_len mem then print "  outside RAM"
+        else print ("  [" ++ to_hex a ++ "] = " ++ str_of_int (ld32 mem a))
+      else print ("  unknown command: " ++ cmd ++ "   (h for help)") in
+    repl ();
+
+let _ = load_map "prog.map";
+let _ = load_src "prog.mere";
+let _ = load_image "prog.bin" 0;
+let _ = load_image "user.bin" 8388608;
+let _ = vec_set st 0 0;
+let _ = print ("rvdbg: " ++ str_of_int (vec_len sym_a) ++ " symbols, "
+               ++ str_of_int (vec_len fn_a) ++ " functions, "
+               ++ str_of_int (vec_len ln_a) ++ " line records, "
+               ++ str_of_int (ram_mb) ++ "MB");
+let _ = where ();
+let _ = help ();
+let _ = repl ();

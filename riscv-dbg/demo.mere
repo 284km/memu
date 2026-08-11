@@ -1,0 +1,19 @@
+// A program with a shape worth stepping through: a recursion whose depth you can
+// see in a backtrace, and a mutable cell whose value you can watch change and
+// then watch change back.
+let rec fact = fn (n: int) ->
+  if n <= 1 then 1
+  else n * fact (n - 1);
+
+let sum_to = fn (n: int) ->
+  let acc = vec_new () in
+  let _ = vec_push acc 0 in
+  let rec go = fn (i: int) ->
+    if i > n then vec_get acc 0
+    else
+      let _ = vec_set acc 0 (vec_get acc 0 + i) in
+      go (i + 1) in
+  go 1;
+
+let _ = print_int (fact 6);
+let _ = print_int (sum_to 10);

@@ -28,6 +28,10 @@ tiny `ecall` syscall ABI — see [`riscv-runc/`](riscv-runc/). Going further,
 [Mere](https://github.com/merelang/mere) itself compiles straight to RV32IM
 (`mere -rv`) and runs on this emulator — including Mere's own self-hosted
 compiler — so the language runs on its own CPU. See [`riscv-mere/`](riscv-mere/).
+And once a program runs on a CPU you wrote, you can debug it there: the core in
+[`riscv-dbg/`](riscv-dbg/) stops at Mere **source lines**, prints a backtrace from
+the frame layout the compiler describes, and steps **backwards** — an undo log per
+instruction, so reverse is exact rather than replayed.
 
 ## Running
 
