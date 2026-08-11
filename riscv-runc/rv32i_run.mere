@@ -92,9 +92,32 @@ let out = vec_new ();
 let mmio_base = 268435456;   // 0x10000000
 let mmio_store = fn addr -> fn v ->
   if addr == mmio_base then print_no_nl (chr (bit_and v 255)) else ();
-// 16550 line-status register: transmitter always ready, nothing received yet.
+
+// Receive side: one byte of lookahead, because the guest asks "is anything
+// waiting?" before it asks "what is it?". `stdin_byte` polls without blocking
+// (read_key would stop the machine dead until a key arrived, which is no use
+// to a CPU that also has timers to service).
+let rx = new_vec 1 (0 - 1);
+let rx_poll = fn () ->
+  if vec_get rx 0 < 0 then vec_set rx 0 (stdin_byte ()) else ();
+// 16550 line status: bit 5 = transmitter empty (always), bit 0 = data ready.
 let mmio_load = fn addr ->
-  if addr == mmio_base + 5 then 96 else 0;
+  if addr == mmio_base + 5 then
+    let _ = rx_poll () in
+    if vec_get rx 0 >= 0 then 97 else 96
+  else if addr == mmio_base then
+    let _ = rx_poll () in
+    let b = vec_get rx 0 in
+    if b < 0 then 0 else let _ = vec_set rx 0 (0 - 1) in b
+  else 0;
+
+// --- machine CSRs ---------------------------------------------------------
+// 4096 slots, one per CSR number, so csrrw/csrrs/csrrc need no lookup table.
+// Only machine mode exists here: mtvec / mepc / mcause / mstatus / mie / mip /
+// mscratch are just numbers until traps arrive, and `mret` reads mepc.
+let csr = new_vec 4096 0;
+let csr_mstatus = 768;   // 0x300
+let csr_mepc = 833;      // 0x341
 let step = fn mem -> fn x -> fn st ->
   let pc = vec_get st 0 in
   let inst = ld32 mem pc in
@@ -191,17 +214,41 @@ let step = fn mem -> fn x -> fn st ->
     else if f3 == 5 then (if f7 == 0 then wrx x rd (bit_shr (mask32 a) sh) else wrx x rd (sra32 a sh))  // SRL/SRA
     else if f3 == 6 then wrx x rd (bit_or a b)                        // OR
     else wrx x rd (bit_and a b)                                       // AND
-  else if op == 0x73 then                                            // ECALL: minimal syscall ABI
-    let a7 = vec_get x 17 in                                         // syscall number
-    if a7 == 93 then vec_set st 1 1                                  // exit -> halt
-    else if a7 == 64 then                                            // write(fd, buf, len)
-      let buf = vec_get x 11 in
-      let len = vec_get x 12 in
-      let rec emit = fn i ->
-        if i >= len then () else let _ = vec_push out (vec_get mem (mask32 (buf + i))) in emit (i + 1) in
-      let _ = emit 0 in
-      vec_set x 10 len                                               // return bytes written in a0
-    else ()
+  else if op == 0x73 then                                            // SYSTEM
+    let csr_n = bit_and (bit_shr inst 20) 4095 in
+    if f3 == 1 || f3 == 2 || f3 == 3 then                            // CSRRW / CSRRS / CSRRC
+      let old = vec_get csr csr_n in
+      let _ = wrx x rd old in
+      let v = if f3 == 1 then mask32 a
+              else if f3 == 2 then bit_or old a
+              else bit_and old (bit_and (bit_not a) 4294967295) in
+      vec_set csr csr_n (mask32 v)
+    else if f3 == 5 || f3 == 6 || f3 == 7 then                       // the -I forms (rs1 = imm)
+      let old = vec_get csr csr_n in
+      let _ = wrx x rd old in
+      let v = if f3 == 5 then rs1
+              else if f3 == 6 then bit_or old rs1
+              else bit_and old (bit_and (bit_not rs1) 4294967295) in
+      vec_set csr csr_n (mask32 v)
+    else if csr_n == 770 then                                        // MRET (0x302)
+      // return to mepc, and restore the interrupt-enable bit MPIE -> MIE
+      let ms = vec_get csr csr_mstatus in
+      let mpie = bit_and (bit_shr ms 7) 1 in
+      let ms2 = bit_or (bit_and ms 4294967287) (bit_shl mpie 3) in   // clear MIE, set from MPIE
+      let _ = vec_set csr csr_mstatus (bit_or ms2 128) in            // MPIE = 1
+      vec_set st 0 (mask32 (vec_get csr csr_mepc))
+    else if csr_n == 261 then ()                                     // WFI (0x105) -> nop
+    else                                                             // ECALL / EBREAK
+      let a7 = vec_get x 17 in                                       // syscall number
+      if a7 == 93 then vec_set st 1 1                                // exit -> halt
+      else if a7 == 64 then                                          // write(fd, buf, len)
+        let buf = vec_get x 11 in
+        let len = vec_get x 12 in
+        let rec emit = fn i ->
+          if i >= len then () else let _ = vec_push out (vec_get mem (mask32 (buf + i))) in emit (i + 1) in
+        let _ = emit 0 in
+        vec_set x 10 len                                             // return bytes written in a0
+      else ()
   else if op == 0x0F then ()                                          // FENCE -> nop
   else vec_set st 1 1;                                                // unknown -> halt
 

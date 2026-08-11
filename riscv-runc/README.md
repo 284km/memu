@@ -67,7 +67,13 @@ address does not move when the RAM size does. One device so far:
 | address | register | behaviour |
 |---------|----------|-----------|
 | `0x10000000` | UART data (write) | the byte goes to stdout as it happens |
-| `0x10000005` | UART line status (read) | `0x60`: transmitter ready, nothing received |
+| `0x10000000` | UART data (read) | the next byte of the host's stdin |
+| `0x10000005` | UART line status (read) | bit 5 transmitter ready (always), bit 0 data waiting |
+
+The receive side keeps one byte of lookahead, because a guest asks "is anything
+waiting?" before it asks "what is it?". Finding out uses Mere's `stdin_byte`,
+which polls without blocking — `read_key` would stop the whole machine until a
+key arrived, which is no use to a CPU that also has timers to service.
 
 `0x10000000` is where QEMU's `virt` machine puts UART0, so a guest driver
 written against it is not learning a private convention. Unlike the `ecall`
@@ -75,7 +81,19 @@ write syscall — which buffers until the guest halts — the UART streams, whic
 is what a guest that never exits needs.
 
 `mere -rv --bare` compiles a Mere program that drives this UART directly,
-through a window capability rather than any host syscall.
+through a window capability rather than any host syscall — in both directions:
+
+```sh
+printf 'hello\nq' | ./rvrun     # against the Mere repo's riscv_bare_echo example
+```
+
+## CSRs and traps
+
+The machine's control-and-status registers are a flat 4096-slot file, so
+`csrrw` / `csrrs` / `csrrc` and their immediate forms work on any number, and
+`mret` returns to `mepc` while restoring the interrupt-enable bit from `MPIE`.
+`wfi` is a nop. Nothing generates a trap yet — that is what the CSRs are here
+for next.
 
 ## Running your own
 
