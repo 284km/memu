@@ -153,6 +153,11 @@ let take_trap = fn st -> fn cause -> fn tval -> fn pc ->
     vec_set st 0 (bit_and tvec 4294967292);
 let step = fn mem -> fn x -> fn st ->
   let pc = vec_get st 0 in
+  // The fetch needs the same guard the loads and stores have: a guest that jumps
+  // somewhere it does not have used to take the emulator down with an "index out
+  // of bounds" about the host's array. An instruction access fault (cause 1) is
+  // the guest's own problem, reported in the guest's terms.
+  if pc + 3 >= vec_len mem then take_trap st 1 pc pc else
   let inst = ld32 mem pc in
   let _ = vec_set st 0 (mask32 (pc + 4)) in                // sequential next PC (branches override)
   let op = bit_and inst 127 in
