@@ -281,6 +281,14 @@ let step = fn mem -> fn x -> fn st ->
       let _ = vec_set csr csr_mstatus (bit_or ms2 128) in            // MPIE = 1
       vec_set st 0 (mask32 (vec_get csr csr_mepc))
     else if csr_n == 261 then ()                                     // WFI (0x105) -> nop
+    else if vec_get csr csr_mtvec != 0 then
+      // A kernel is installed, so an environment call is the guest's business:
+      // cause 11, vectored like any other trap. That is what makes a syscall
+      // boundary possible — the user process asks, the kernel answers, and the
+      // emulator is not in the conversation. With no kernel (mtvec still zero)
+      // the tiny host ABI below stands in, which is what every non-bare program
+      // on this emulator has always used.
+      take_trap st 11 0 pc
     else                                                             // ECALL / EBREAK
       let a7 = vec_get x 17 in                                       // syscall number
       if a7 == 93 then vec_set st 1 1                                // exit -> halt
@@ -345,6 +353,18 @@ let prog = read_file_bytes "prog.bin";
 let pn = vec_len prog;
 let rec load = fn i -> if i >= pn then () else let _ = vec_set mem i (vec_get prog i) in load (i + 1);
 let _ = load 0;
+// A second image, if there is one, at 8 MB — the bootloader's job, done by the
+// bootloader. A kernel with no filesystem has to get its first user process from
+// somewhere, and `mere -rv --load-base 8388608` builds one to live here.
+let user_base = 8388608;   // 0x800000
+let _ =
+  if file_exists "user.bin" then
+    let u = read_file_bytes "user.bin" in
+    let un = vec_len u in
+    let rec loadu = fn i ->
+      if i >= un then () else let _ = vec_set mem (user_base + i) (vec_get u i) in loadu (i + 1) in
+    loadu 0
+  else ();
 let _ = vec_set x 2 0x70000;     // sp near the top of RAM (the program also sets it)
 let _ = vec_set st 0 0;          // PC = 0 = _start
 

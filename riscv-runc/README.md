@@ -89,6 +89,25 @@ through a window capability rather than any host syscall — in both directions:
 printf 'hello\nq' | ./rvrun     # against the Mere repo's riscv_bare_echo example
 ```
 
+## Two images, and who answers a syscall
+
+The emulator loads `prog.bin` at address 0 and, if the file is there, `user.bin`
+at **8 MB** — a bootloader's job, done by the bootloader, because a kernel with no
+filesystem has to get its first user process from somewhere.
+`mere -rv --load-base 8388608` builds an image to live there.
+
+An `ecall` goes to whoever is in charge:
+
+- **no kernel** (`mtvec` still zero) — the tiny host ABI above answers it, which is
+  what every non-bare program on this emulator has always used
+- **a kernel installed** — it traps like any other exception (cause 11), and the
+  guest's own handler answers
+
+That second line is what makes a syscall boundary possible: a separately compiled,
+ordinary Mere program calls `print`, and a Mere kernel writes the bytes. Neither
+the emulator nor the user program is in that conversation. See the main repo's
+`examples/riscv_bare_user.mere` and `examples/riscv_user_prog.mere`.
+
 ## CSRs, traps and the timer
 
 The machine's control-and-status registers are a flat 4096-slot file, so
