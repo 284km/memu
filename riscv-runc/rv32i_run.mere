@@ -443,6 +443,20 @@ let timer_pending = fn () ->
   else if bit_and (bit_shr (vec_get csr csr_mstatus) 3) 1 == 0 then 0   // MIE off
   else if bit_and (bit_shr (vec_get csr csr_mie) 7) 1 == 0 then 0       // MTIE off
   else 1;
+// `rvrun <ram_mb> trace` reports where the guest is, every 100M instructions, on
+// stderr. A guest that prints nothing for ten minutes gives no other clue: the
+// halt reason only arrives when it halts, and a guest stuck in a loop never does.
+// The pc can be read back to a symbol with the `S` lines of `mere -rvg`.
+//
+// Off by default, and off costs one comparison per instruction rather than the
+// two vec operations the counter needs. mtime cannot serve as the counter: it is
+// masked to 32 bits and the guest is allowed to write to it.
+let trace = match args () with
+  | Cons (_, Cons (_, _)) -> 1
+  | _ -> 0;
+let icount = new_vec 1 0;
+let trace_every = 100000000;
+
 let rec drive = fn () ->
   if vec_get st 1 == 1 then ()
   else
@@ -451,6 +465,14 @@ let rec drive = fn () ->
       if timer_pending () == 1 then
         let _ = vec_set csr csr_mip (bit_or (vec_get csr csr_mip) 128) in
         take_trap st 2147483655 0 (vec_get st 0)      // 0x80000007: machine timer
+      else () in
+    let _ =
+      if trace == 1 then
+        let n = vec_get icount 0 + 1 in
+        let _ = vec_set icount 0 n in
+        if n % trace_every == 0 then
+          print_err ("rvrun: " ++ str_of_int n ++ " insns, pc=" ++ str_of_int (vec_get st 0) ++ "\n")
+        else ()
       else () in
     if vec_get st 1 == 1 then () else let _ = step mem x st in drive ();
 let _ = drive ();
