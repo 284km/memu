@@ -35,6 +35,16 @@ let new_vec = fn n -> fn x ->
   let rec go = fn i -> if i >= n then () else let _ = vec_push v x in go (i + 1) in
   let _ = go 0 in v;
 
+// Why the machine stopped. Every halt used to be `vec_set st 1 1` and said
+// nothing, so a guest that stopped on its first unimplemented instruction looked
+// exactly like one that ran to completion and printed nothing -- which is what a
+// 4 MB guest did, and there was no way to tell the two apart from the outside.
+let halt_exit = 1;        // the guest asked to exit
+let halt_trap = 2;        // a trap with no handler installed
+let halt_mulh = 3;        // MULH / MULHSU / MULHU, which this core does not have
+let halt_finisher = 4;    // a write to QEMU virt's test finisher
+let halt = fn st -> fn (why: int) -> let _ = vec_set st 2 why in vec_set st 1 1;
+
 // --- where RAM is ---------------------------------------------------------
 // Address 0 by default: this backend's own layout, code from 0 and devices
 // above it. Pass `virt` as the second argument for QEMU's virt board, where
@@ -135,7 +145,7 @@ let mmio_store = fn st -> fn addr -> fn v ->
   if addr == mmio_base then print_no_nl (chr (bit_and v 255))
   else if addr == clint_mtimecmp then vec_set timer 1 (mask32 v)
   else if addr == clint_mtime then vec_set timer 0 (mask32 v)
-  else if addr == test_finisher then vec_set st 1 1
+  else if addr == test_finisher then halt st halt_finisher
   else ();
 
 // Receive side: one byte of lookahead, because the guest asks "is anything
@@ -177,7 +187,7 @@ let csr_mtval = 835;     // 0x343
 // traps existed, rather than jumping to address 0 and corrupting itself.
 let take_trap = fn st -> fn cause -> fn tval -> fn pc ->
   let tvec = vec_get csr csr_mtvec in
-  if tvec == 0 then vec_set st 1 1
+  if tvec == 0 then halt st halt_trap
   else
     let ms = vec_get csr csr_mstatus in
     let mie = bit_and (bit_shr ms 3) 1 in
@@ -287,7 +297,7 @@ let step = fn mem -> fn x -> fn st ->
      else if f3 == 7 then                                            // REMU (unsigned)
        let au = mask32 a in let bu = mask32 b in
        if bu == 0 then wrx x rd au else wrx x rd (mask32 (au - (au / bu) * bu))
-     else vec_set st 1 1)                                            // MULH/MULHSU/MULHU: not implemented
+     else halt st halt_mulh)                                         // MULH/MULHSU/MULHU: not implemented
   else if op == 0x33 then                                             // R-type ALU (base)
     let sh = bit_and b 31 in
     if f3 == 0 then (if f7 == 0 then wrx x rd (mask32 (a + b)) else wrx x rd (mask32 (a - b)))  // ADD/SUB
@@ -332,7 +342,7 @@ let step = fn mem -> fn x -> fn st ->
       take_trap st 11 0 pc
     else                                                             // ECALL / EBREAK
       let a7 = vec_get x 17 in                                       // syscall number
-      if a7 == 93 then vec_set st 1 1                                // exit -> halt
+      if a7 == 93 then halt st halt_exit                             // exit -> halt
       else if a7 == 64 then                                          // write(fd, buf, len)
         let buf = vec_get x 11 in
         let len = vec_get x 12 in
@@ -389,7 +399,7 @@ let ram_mb = match args () with
   | Nil -> 8;
 let mem = new_vec (ram_mb * 1048576) 0;
 let x = new_vec 32 0;
-let st = new_vec 2 0;
+let st = new_vec 3 0;
 let prog = read_file_bytes "prog.bin";
 let pn = vec_len prog;
 let rec load = fn i -> if i >= pn then () else let _ = stb mem (dram_base + i) (vec_get prog i) in load (i + 1);
@@ -444,6 +454,17 @@ let n = vec_len out;
 let rec emit = fn i -> if i >= n then () else let _ = strbuf_push sbuf (chr (vec_get out i)) in emit (i + 1);
 let _ = emit 0;
 let _ = print_no_nl (strbuf_to_str sbuf);   // raw: don't append a newline
+// and why it stopped, when that was not the guest asking. On stderr, so a gate
+// comparing stdout against a reference is unaffected, and named rather than
+// numbered: a silent halt and a finished program used to be the same event seen
+// from here.
+let why = vec_get st 2 in
+let _ = if why == halt_exit then () else
+  print_err ("rvrun: halted at pc=" ++ str_of_int (vec_get st 0) ++ " -- "
+    ++ (if why == halt_mulh then "MULH/MULHSU/MULHU, which this core does not implement"
+        else if why == halt_trap then "a trap with no handler installed"
+        else if why == halt_finisher then "a write to the test finisher"
+        else "no reason recorded (a halt that predates this message)") ++ "\n");
 // exit explicitly so the runtime doesn't echo this program's own final value
 // after the emulated program's output.
 exit 0
