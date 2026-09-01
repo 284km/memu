@@ -43,6 +43,7 @@ let halt_exit = 1;        // the guest asked to exit
 let halt_trap = 2;        // a trap with no handler installed
 let halt_mulh = 3;        // MULH / MULHSU / MULHU, which this core does not have
 let halt_finisher = 4;    // a write to QEMU virt's test finisher
+let halt_crossed = 5;     // `trace`: the guest's heap top reached its stack
 let halt = fn st -> fn (why: int) -> let _ = vec_set st 2 why in vec_set st 1 1;
 
 // --- where RAM is ---------------------------------------------------------
@@ -506,6 +507,18 @@ let trace = match args () with
   | _ -> 0;
 let icount = new_vec 1 0;
 let trace_every = 100000000;
+// `mere -rv` grows its heap up in gp and its stack down in sp, and every
+// allocation it emits checks `gp < sp` first. Nothing checked that the invariant
+// still held BETWEEN allocations -- a guest that walked its stack pointer down
+// past the heap top, or wrote past either end, went on running and produced
+// wrong values a long way from the cause.
+//
+// x2 and x3 are sp and gp by that backend's convention, so the machine can watch
+// it: under `trace`, the first instruction at which they cross stops the guest
+// and says so. It is a report, not a rule -- a guest that is not from `mere -rv`
+// may use these registers for anything, which is why it is off by default and
+// lives with the tracing rather than in `step`.
+let crossed = new_vec 1 0;
 
 let rec drive = fn () ->
   if vec_get st 1 == 1 then ()
@@ -520,8 +533,21 @@ let rec drive = fn () ->
       if trace == 1 then
         let n = vec_get icount 0 + 1 in
         let _ = vec_set icount 0 n in
+        let gp = vec_get x 3 in
+        let sp = vec_get x 2 in
+        let _ =
+          if gp >= sp && gp != 0 && vec_get crossed 0 == 0 then
+            let _ = vec_set crossed 0 1 in
+            let _ = print_err ("rvrun: heap and stack CROSSED at " ++ str_of_int n
+                     ++ " insns, pc=" ++ str_of_int (vec_get st 0)
+                     ++ " gp=" ++ str_of_int gp ++ " sp=" ++ str_of_int sp ++ "\n") in
+            let _ = vec_set st 2 halt_crossed in
+            vec_set st 1 1
+          else () in
         if n % trace_every == 0 then
-          print_err ("rvrun: " ++ str_of_int n ++ " insns, pc=" ++ str_of_int (vec_get st 0) ++ "\n")
+          print_err ("rvrun: " ++ str_of_int n ++ " insns, pc=" ++ str_of_int (vec_get st 0)
+                   ++ " gp=" ++ str_of_int gp ++ " sp=" ++ str_of_int sp
+                   ++ " free=" ++ str_of_int (sp - gp) ++ "\n")
         else ()
       else () in
     if vec_get st 1 == 1 then () else let _ = step mem x st in drive ();
@@ -539,6 +565,7 @@ let _ = if why == halt_exit then () else
     ++ (if why == halt_mulh then "MULH/MULHSU/MULHU, which this core does not implement"
         else if why == halt_trap then "a trap with no handler installed"
         else if why == halt_finisher then "a write to the test finisher"
+        else if why == halt_crossed then "the guest's heap top reached its stack (trace)"
         else "no reason recorded (a halt that predates this message)") ++ "\n");
 // exit explicitly so the runtime doesn't echo this program's own final value
 // after the emulated program's output.
