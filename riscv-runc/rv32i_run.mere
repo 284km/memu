@@ -423,6 +423,56 @@ let _ =
       if i >= un then () else let _ = stb mem (user_base + i) (vec_get u i) in loadu (i + 1) in
     loadu 0
   else ();
+// --- the argument block ---------------------------------------------------
+// `rvrun <ram> [trace|virt] -- <args...>` hands the guest a command line. A
+// guest built by `mere -rv` has no host to ask for one, so the loader leaves it
+// in RAM at a place derived from the RAM size, exactly as that backend computes
+// it: the last 24 KB, above the stack and the fantasy-console MMIO.
+//
+//   +0          magic "ARGV" -- without it the guest reads no arguments at all,
+//               which is what keeps stale RAM from becoming a pointer
+//   +4          count
+//   +8 + 4*i    pointer to argument i, in the guest's own [len][bytes] layout
+//   ...         the blocks
+//
+// This is the one place the loader has to agree with the compiler on an address,
+// and it is wrong at a different `--ram` on either side -- the same requirement
+// `mere -rv --ram N` already puts on the emulator's first argument.
+let argv_base = dram_base + ram_mb * 1048576 - 0x6000;
+let rec drop_to_sep = fn l ->
+  match l with
+  | Nil -> Nil
+  | Cons (a, rest) -> if str_eq a "--" then rest else drop_to_sep rest;
+let guest_args = drop_to_sep (args ());
+let rec count_of = fn l -> match l with Nil -> 0 | Cons (_, r) -> 1 + count_of r;
+let gn = count_of guest_args;
+let stw = fn a -> fn v ->
+  let _ = stb mem a v in
+  let _ = stb mem (a + 1) (bit_shr v 8) in
+  let _ = stb mem (a + 2) (bit_shr v 16) in
+  stb mem (a + 3) (bit_shr v 24);
+// Each block is [len][bytes], padded so the next one starts word-aligned --
+// the guest loads the length with `lw`.
+let rec put_str = fn at -> fn s ->
+  let n = str_len s in
+  let _ = stw at n in
+  let rec bytes = fn i ->
+    if i >= n then () else let _ = stb mem (at + 4 + i) (ord (char_at s i)) in bytes (i + 1) in
+  let _ = bytes 0 in
+  at + 4 + n + bit_and (4 - bit_and n 3) 3;
+let _ =
+  if gn == 0 then ()
+  else
+    let _ = stw argv_base 0x41524756 in            // "ARGV", as the compiler spells it
+    let _ = stw (argv_base + 4) gn in
+    let rec lay = fn i -> fn at -> fn l ->
+      match l with
+      | Nil -> ()
+      | Cons (a, rest) ->
+        let _ = stw (argv_base + 8 + i * 4) at in
+        lay (i + 1) (put_str at a) rest in
+    lay 0 (argv_base + 8 + gn * 4) guest_args;
+
 let _ = vec_set x 2 (dram_base + 0x70000);   // sp in RAM (the program also sets it)
 let _ = vec_set st 0 dram_base;              // PC = the first byte of RAM = _start
 
@@ -452,7 +502,7 @@ let timer_pending = fn () ->
 // two vec operations the counter needs. mtime cannot serve as the counter: it is
 // masked to 32 bits and the guest is allowed to write to it.
 let trace = match args () with
-  | Cons (_, Cons (_, _)) -> 1
+  | Cons (_, Cons (b, _)) -> if str_eq b "trace" then 1 else 0
   | _ -> 0;
 let icount = new_vec 1 0;
 let trace_every = 100000000;
