@@ -61,6 +61,22 @@ let virt = match args () with
 let dram_base = if virt == 1 then 2147483648 else 0;      // 0x80000000
 
 // --- little-endian byte memory ------------------------------------------
+// Stores that put a STACK-RANGE VALUE at a HEAP-RANGE ADDRESS, last 8, dumped on
+// an abnormal halt. Heap data corrupted with frame addresses is this exact
+// signature, and the trap that finally reports it is thousands of instructions
+// downstream of the store that did it. try_or records legitimately match (they
+// hold sp and fp), so the pc column is what separates the suspect from them.
+// Defined here, before `step`, because top-level order is visibility; armed
+// where `trace` is parsed.
+let swon = new_vec 1 0;
+// An exact-address store watch: every store that hits [watch, watch+4) prints
+// the pc and the value, as it happens. `./rvrun <ram> watch <addr> ...`
+let watch_addr = new_vec 1 0;
+let swring = new_vec 24 0;    // 8 x (pc, addr, val)
+let swi = new_vec 1 0;
+let sw_hi = 33554432;          // heap range: below this RAM's midpoint
+let stack_lo = 58720256;       // values in the top ~8MB of a 64MB machine
+
 let ldb = fn mem -> fn a -> vec_get mem (a - dram_base);
 let stb = fn mem -> fn a -> fn v -> vec_set mem (a - dram_base) (bit_and v 255);
 let in_ram = fn mem -> fn a ->
@@ -252,7 +268,19 @@ let step = fn mem -> fn x -> fn st ->
   else if op == 0x23 then                                             // stores
     let addr = mask32 (a + imm_s inst) in
     if in_ram mem addr then
-      if f3 == 2 then st32 mem addr b                                  // SW
+      if f3 == 2 then
+        let _ = (let w = vec_get watch_addr 0 in
+                 if w != 0 && addr >= w && addr < w + 32 then
+                   print_err ("rvrun: WATCH store pc=" ++ str_of_int pc ++ " addr=" ++ str_of_int addr ++ " val=" ++ str_of_int b ++ "\n")
+                 else ()) in
+        let _ = (if vec_get swon 0 == 1 && addr < sw_hi && b > stack_lo && b < 67108864 then
+                   let i3 = bit_and (vec_get swi 0) 7 * 3 in
+                   let _ = vec_set swring i3 pc in
+                   let _ = vec_set swring (i3 + 1) addr in
+                   let _ = vec_set swring (i3 + 2) b in
+                   vec_set swi 0 (vec_get swi 0 + 1)
+                 else ()) in
+        st32 mem addr b                                                // SW
       else if f3 == 0 then stb mem addr b                              // SB
       else if f3 == 1 then                                             // SH
         let _ = stb mem addr b in stb mem (mask32 (addr + 1)) (bit_shr b 8)
@@ -505,6 +533,16 @@ let timer_pending = fn () ->
 let trace = match args () with
   | Cons (_, Cons (b, _)) -> if str_eq b "trace" then 1 else 0
   | _ -> 0;
+let _ = vec_set swon 0 trace;
+// `watch <addr>` may follow the ram size (before `--`)
+let rec find_watch = fn l ->
+  match l with
+  | Nil -> 0
+  | Cons (a, rest) ->
+    if str_eq a "--" then 0
+    else if str_eq a "watch" then (match rest with Cons (n, _) -> int_of_str n | Nil -> 0)
+    else find_watch rest;
+let _ = vec_set watch_addr 0 (find_watch (args ()));
 let icount = new_vec 1 0;
 let trace_every = 100000000;
 // `mere -rv` grows its heap up in gp and its stack down in sp, and every
@@ -519,6 +557,13 @@ let trace_every = 100000000;
 // may use these registers for anything, which is why it is off by default and
 // lives with the tracing rather than in `step`.
 let crossed = new_vec 1 0;
+// The last 16 pc values, dumped when the guest halts under `trace`. A guest that
+// trapped executing garbage tells you WHERE it died; what you need is where it
+// CAME FROM -- the jump that went wrong is several instructions upstream, and
+// nothing else records it.
+let ring = new_vec 16 0;
+let ringi = new_vec 1 0;
+
 
 let rec drive = fn () ->
   if vec_get st 1 == 1 then ()
@@ -544,6 +589,8 @@ let rec drive = fn () ->
             let _ = vec_set st 2 halt_crossed in
             vec_set st 1 1
           else () in
+        let _ = vec_set ring (bit_and (vec_get ringi 0) 15) (vec_get st 0) in
+        let _ = vec_set ringi 0 (vec_get ringi 0 + 1) in
         if n % trace_every == 0 then
           print_err ("rvrun: " ++ str_of_int n ++ " insns, pc=" ++ str_of_int (vec_get st 0)
                    ++ " gp=" ++ str_of_int gp ++ " sp=" ++ str_of_int sp
@@ -552,6 +599,41 @@ let rec drive = fn () ->
       else () in
     if vec_get st 1 == 1 then () else let _ = step mem x st in drive ();
 let _ = drive ();
+
+// Under `trace`, say where the guest has just been -- oldest first. Only on an
+// abnormal halt: a guest that exited on purpose has nothing to explain.
+let _ =
+  if trace == 1 && vec_get st 2 != halt_exit && vec_get st 2 != halt_finisher then
+    let n0 = vec_get ringi 0 in
+    let rec dump = fn i ->
+      if i >= 16 then ()
+      else
+        let idx = bit_and (n0 + i) 15 in
+        let _ = (if vec_get ring idx == 0 && i == 0 then () else
+                 print_err ("rvrun: ring[" ++ str_of_int (i - 16) ++ "] pc=" ++ str_of_int (vec_get ring idx) ++ "\n")) in
+        dump (i + 1) in
+    let _ = dump 0 in
+    let n1 = vec_get swi 0 in
+    let rec sdump = fn i ->
+      if i >= 8 then ()
+      else
+        let i3 = bit_and (n1 + i) 7 * 3 in
+        let _ = (if vec_get swring i3 == 0 then () else
+                 print_err ("rvrun: heapwrite pc=" ++ str_of_int (vec_get swring i3)
+                   ++ " addr=" ++ str_of_int (vec_get swring (i3 + 1))
+                   ++ " val=" ++ str_of_int (vec_get swring (i3 + 2)) ++ "\n")) in
+        sdump (i + 1) in
+    let _ = sdump 0 in
+    // ...and the registers: ra names the caller, a0-a2 are the helper's
+    // arguments, and a corrupt pointer among them is the thing to chase.
+    let rec regs = fn i ->
+      if i >= 32 then ()
+      else
+        let _ = (if vec_get x i == 0 then () else
+                 print_err ("rvrun: x" ++ str_of_int i ++ " = " ++ str_of_int (vec_get x i) ++ "\n")) in
+        regs (i + 1) in
+    regs 1
+  else ();
 
 // The guest's output already went out as it was written, so there is nothing to
 // flush here.
