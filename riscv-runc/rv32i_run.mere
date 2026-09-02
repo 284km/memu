@@ -89,6 +89,97 @@ let st32 = fn mem -> fn a -> fn v ->
   let _ = stb mem (a + 2) (bit_shr v 16) in
   stb mem (a + 3) (bit_shr v 24);
 
+// --- the guest's open files: openat / read / close / faccessat --------------
+// A hosted `-rv` program can read a file now (mere v0.1.402 lowers read_file
+// and file_exists onto these Linux numbers), so this has to answer for them.
+//
+// The whole file is read at OPEN time into one arena and the fd carries a
+// cursor over that snapshot. Mere has no descriptor-level file API to pass
+// straight through, and the program this emulator is carried for opens a
+// script, reads it to the end and closes it -- for which a cursor over a
+// snapshot gives the same answers a real read would.
+//
+// It is NOT silent about its limits, because a table that quietly reused a slot
+// would hand the guest another file's bytes and a truncating read would look
+// like a short file. Past `fd_cap` concurrent files it answers -EMFILE, past the
+// arena -ENOMEM, an unknown descriptor -EBADF, and a missing path -ENOENT --
+// all of them what Linux says, so a guest that handles the errno handles this.
+let fd_cap = 8;
+// 0-2 are the standard streams. The guest never opens them, and handing one out
+// would make a read of a script indistinguishable from a read of stdin.
+let fd_first = 3;
+let fd_used = new_vec fd_cap 0;
+let fd_base = new_vec fd_cap 0;
+let fd_len = new_vec fd_cap 0;
+let fd_pos = new_vec fd_cap 0;
+// Closing rolls the arena back when the block was the last one allocated, which
+// is every close in a one-file-at-a-time reader -- without it a long `require`
+// chain exhausts the arena for files it is no longer holding.
+let fbuf_cap = 4194304;
+let fbuf = new_vec fbuf_cap 0;
+let fbuf_top = new_vec 1 0;
+let rec fd_free = fn i ->
+  if i >= fd_cap then 0 - 1
+  else if vec_get fd_used i == 0 then i
+  else fd_free (i + 1);
+// A path out of guest memory, NUL-terminated. Bounded: an unterminated pointer
+// would otherwise walk off the end of RAM and take the EMULATOR down with a
+// bounds fault, reporting a bug in this program instead of in the guest.
+let path_max = 4096;
+let cstr_at = fn mem -> fn p ->
+  let sb = strbuf_new () in
+  let rec go = fn i ->
+    if i >= path_max then () else
+      let c = ldb mem (p + i) in
+      if c == 0 then () else let _ = strbuf_push sb (chr c) in go (i + 1) in
+  let _ = go 0 in
+  strbuf_to_str sb;
+let sys_openat = fn mem -> fn pathp ->
+  let path = cstr_at mem pathp in
+  if str_len path >= path_max then 0 - 36                              // -ENAMETOOLONG
+  else if file_exists path then
+    let slot = fd_free fd_first in
+    if slot < 0 then 0 - 24                                            // -EMFILE
+    else
+      let bytes = read_file_bytes path in
+      let n = vec_len bytes in
+      let base = vec_get fbuf_top 0 in
+      if base + n > fbuf_cap then 0 - 12                               // -ENOMEM
+      else
+        let rec copy = fn i ->
+          if i >= n then () else
+            let _ = vec_set fbuf (base + i) (vec_get bytes i) in copy (i + 1) in
+        let _ = copy 0 in
+        let _ = vec_set fbuf_top 0 (base + n) in
+        let _ = vec_set fd_used slot 1 in
+        let _ = vec_set fd_base slot base in
+        let _ = vec_set fd_len slot n in
+        let _ = vec_set fd_pos slot 0 in
+        slot
+  else 0 - 2;                                                          // -ENOENT
+let fd_bad = fn fd -> fd < fd_first || fd >= fd_cap || vec_get fd_used fd == 0;
+let sys_read = fn mem -> fn fd -> fn buf -> fn cnt ->
+  if fd_bad fd then 0 - 9                                              // -EBADF
+  else
+    let pos = vec_get fd_pos fd in
+    let left = vec_get fd_len fd - pos in
+    let n = if cnt < left then cnt else left in
+    let base = vec_get fd_base fd in
+    let rec copy = fn i ->
+      if i >= n then () else
+        let _ = stb mem (buf + i) (vec_get fbuf (base + pos + i)) in copy (i + 1) in
+    let _ = copy 0 in
+    let _ = vec_set fd_pos fd (pos + n) in
+    n;
+let sys_close = fn fd ->
+  if fd_bad fd then 0 - 9                                              // -EBADF
+  else
+    let base = vec_get fd_base fd in
+    let top = base + vec_get fd_len fd in
+    let _ = if top == vec_get fbuf_top 0 then vec_set fbuf_top 0 base else () in
+    let _ = vec_set fd_used fd 0 in
+    0;
+
 // --- register file (x0 stays 0; writes to x0 are dropped) ----------------
 let wrx = fn x -> fn i -> fn v -> if i == 0 then () else vec_set x i (mask32 v);
 
@@ -407,6 +498,14 @@ let step = fn mem -> fn x -> fn st ->
       // getrandom(buf, len, flags) -- host entropy, byte by byte. A machine
       // with no host has none of this, which is why the compiler refuses these
       // under --bare rather than inventing a seed.
+      else if a7 == 56 then                                            // openat
+        vec_set x 10 (sys_openat mem (vec_get x 11))
+      else if a7 == 63 then                                            // read
+        vec_set x 10 (sys_read mem (vec_get x 10) (vec_get x 11) (vec_get x 12))
+      else if a7 == 57 then                                            // close
+        vec_set x 10 (sys_close (vec_get x 10))
+      else if a7 == 48 then                                            // faccessat
+        vec_set x 10 (if file_exists (cstr_at mem (vec_get x 11)) then 0 else 0 - 2)
       else if a7 == 278 then
         // buf is a0 and len is a1 -- NOT write()'s (fd, buf, len) shape one
         // line up. The first version copied that shape, filled zero bytes at
@@ -602,7 +701,18 @@ let ring = new_vec 16 0;
 let ringi = new_vec 1 0;
 
 
-let rec drive = fn () ->
+// The instruction loop MUST compile to a loop, not to recursion: its depth
+// would otherwise be the emulated instruction count. Mere's C backend gives a
+// single-argument top-level self-tail-call a `goto` since v0.1.402 -- before
+// that it did not, and `drive` survived only because clang's sibling-call
+// optimisation flattened it. That is not a property of a program: adding the
+// openat/read/close service below was enough to change clang's mind, and every
+// long-running guest then died with "stack overflow (recursion too deep)" --
+// which reads as a fault in the guest, or in the compiler that produced it, and
+// was neither. `drive` takes a counter it does not use so that it is a
+// one-argument function of the shape the transform recognises.
+
+let rec drive = fn (n: int) ->
   if vec_get st 1 == 1 then ()
   else
     let _ = vec_set timer 0 (mask32 (vec_get timer 0 + 1)) in
@@ -634,8 +744,8 @@ let rec drive = fn () ->
                    ++ " free=" ++ str_of_int (sp - gp) ++ "\n")
         else ()
       else () in
-    if vec_get st 1 == 1 then () else let _ = step mem x st in drive ();
-let _ = drive ();
+    if vec_get st 1 == 1 then () else let _ = step mem x st in drive (n + 1);
+let _ = drive 0;
 
 // Under `trace`, say where the guest has just been -- oldest first. Only on an
 // abnormal halt: a guest that exited on purpose has nothing to explain.
