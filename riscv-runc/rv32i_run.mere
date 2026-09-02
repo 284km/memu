@@ -386,7 +386,44 @@ let step = fn mem -> fn x -> fn st ->
         let _ = emit 0 in
         let _ = print_no_nl (strbuf_to_str sb) in
         vec_set x 10 len                                             // return bytes written in a0
-      else ()
+      // clock_gettime64(clockid, *timespec64) -- Linux's rv32 number, like the
+      // write and exit above. Every clockid gets the host's wall clock: this
+      // Mere has no separate monotonic source, and a wall clock that a guest
+      // uses for elapsed time is wrong only when the host clock steps -- said
+      // here rather than papered over. The struct is two little-endian int64s,
+      // sec then nsec, written as four words. The host clock is a double of
+      // epoch seconds, whose 52-bit mantissa reads out to ~250 ns -- honest for
+      // a clock the guest converts straight back to a double.
+      else if a7 == 403 then
+        let ts = vec_get x 11 in
+        let t = time () in
+        let sec = int_of_float t in
+        let nsec = int_of_float ((t - float_of_int sec) * 1000000000.0) in
+        let _ = st32 mem (mask32 ts) (bit_and sec 4294967295) in
+        let _ = st32 mem (mask32 (ts + 4)) (bit_shr sec 32) in
+        let _ = st32 mem (mask32 (ts + 8)) nsec in
+        let _ = st32 mem (mask32 (ts + 12)) 0 in
+        vec_set x 10 0
+      // getrandom(buf, len, flags) -- host entropy, byte by byte. A machine
+      // with no host has none of this, which is why the compiler refuses these
+      // under --bare rather than inventing a seed.
+      else if a7 == 278 then
+        // buf is a0 and len is a1 -- NOT write()'s (fd, buf, len) shape one
+        // line up. The first version copied that shape, filled zero bytes at
+        // address four, and forty draws of random_int came back identical:
+        // the property test caught an ABI transcription, not weak entropy.
+        let buf = vec_get x 10 in
+        let len = vec_get x 11 in
+        let rec fill = fn i ->
+          if i >= len then () else
+            let _ = stb mem (mask32 (buf + i)) (random_int 256) in fill (i + 1) in
+        let _ = fill 0 in
+        vec_set x 10 len
+      // An unknown syscall answers -ENOSYS, as Linux does. It used to fall
+      // through silently -- a0 kept whatever it held, and a guest calling a
+      // syscall this machine had not learned yet read its own argument back as
+      // the result, which is a wrong answer with nobody's name on it.
+      else vec_set x 10 (0 - 38)
   else if op == 0x0F then ()                                          // FENCE -> nop
   else take_trap st 2 inst pc;                                        // illegal instruction
 
