@@ -267,6 +267,61 @@ let sys_close = fn fd ->
     let _ = vec_set fd_used fd 0 in
     0;
 
+// --- the ABI contract instrument (armed by `abi` on the command line) --------
+// On every call that WRITES ra, snapshot the callee-saved registers s1..s10
+// (x9, x18..x26); on every plain `ret`, find the frame whose return address is
+// the ret's target and compare. A mismatch names the pc, the register, and
+// both values -- which is a violated calling convention, the thing that is
+// otherwise visible only as a value silently wrong much later.
+//
+// s11 (x27) is excluded: it is the backend's far-jump scratch, dead between
+// jumps, and the first run of the ad-hoc version reported it as a false
+// positive before the exclusion was understood.
+//
+// UNWIND-AWARE, which the ad-hoc version never had to be: a `fail` caught by
+// try_or is a longjmp, not a return, so frames are popped WITHOUT comparison
+// until the return address matches -- those frames never returned, and holding
+// their calls to the returned-state contract would accuse every caught failure.
+// A ret matching NOTHING on the stack clears it (control went somewhere new).
+let abi_on = new_vec 1 0;
+let abi_ra = vec_new ();
+let abi_s = vec_new ();
+let abi_n = new_vec 1 0;
+let abi_hits = new_vec 1 0;
+let abi_push = fn x -> fn (link: int) ->
+  let n = vec_get abi_n 0 in
+  let _ = (if n < vec_len abi_ra then vec_set abi_ra n link else vec_push abi_ra link) in
+  let rec put = fn (i: int) ->
+    if i >= 10 then () else
+      let r = if i == 0 then 9 else 17 + i in
+      let v = vec_get x r in
+      let slot = n * 10 + i in
+      let _ = (if slot < vec_len abi_s then vec_set abi_s slot v else vec_push abi_s v) in
+      put (i + 1) in
+  let _ = put 0 in
+  vec_set abi_n 0 (n + 1);
+let abi_ret = fn x -> fn (target: int) -> fn (pc: int) ->
+  let rec seek = fn (n: int) ->
+    if n <= 0 then 0 - 1
+    else if vec_get abi_ra (n - 1) == target then n - 1
+    else seek (n - 1) in
+  let hit = seek (vec_get abi_n 0) in
+  if hit < 0 then vec_set abi_n 0 0
+  else
+    let rec cmp = fn (i: int) ->
+      if i >= 10 then () else
+        let r = if i == 0 then 9 else 17 + i in
+        let want = vec_get abi_s (hit * 10 + i) in
+        let got = vec_get x r in
+        let _ = (if want == got then () else
+          let _ = vec_set abi_hits 0 (vec_get abi_hits 0 + 1) in
+          print_err ("ABI: x" ++ str_of_int r ++ " not preserved across the call returning to "
+                     ++ str_of_int target ++ " (ret at pc=" ++ str_of_int pc
+                     ++ "): saved " ++ str_of_int want ++ ", now " ++ str_of_int got ++ "\n")) in
+        cmp (i + 1) in
+    let _ = cmp 0 in
+    vec_set abi_n 0 hit;
+
 // --- register file (x0 stays 0; writes to x0 are dropped) ----------------
 let wrx = fn x -> fn i -> fn v -> if i == 0 then () else vec_set x i (mask32 v);
 
@@ -411,10 +466,16 @@ let step = fn mem -> fn x -> fn st ->
   if op == 0x37 then wrx x rd (imm_u inst)                              // LUI
   else if op == 0x17 then wrx x rd (mask32 (pc + imm_u inst))           // AUIPC
   else if op == 0x6F then                                              // JAL
+    let _ = (if vec_get abi_on 0 == 1 && rd == 1 then abi_push x (mask32 (pc + 4)) else ()) in
     let _ = wrx x rd (mask32 (pc + 4)) in
     vec_set st 0 (mask32 (pc + imm_j inst))
   else if op == 0x67 then                                             // JALR
     let t = bit_and (mask32 (a + imm_i inst)) 4294967294 in            // clear bit 0
+    let _ = (if vec_get abi_on 0 == 1 then
+               (if rd == 1 then abi_push x (mask32 (pc + 4))
+                else if rd == 0 && rs1 == 1 then abi_ret x t pc
+                else ())
+             else ()) in
     let _ = wrx x rd (mask32 (pc + 4)) in
     vec_set st 0 t
   else if op == 0x63 then                                             // branches
@@ -771,6 +832,11 @@ let rec find_watch = fn l ->
     else if str_eq a "watch" then (match rest with Cons (n, _) -> int_of_str n | Nil -> 0)
     else find_watch rest;
 let _ = vec_set watch_addr 0 (find_watch (args ()));
+let rec find_abi = fn l ->
+  match l with
+  | Nil -> 0
+  | Cons (s, rest) -> if str_eq s "abi" then 1 else find_abi rest;
+let _ = vec_set abi_on 0 (find_abi (args ()));
 let icount = new_vec 1 0;
 let trace_every = 100000000;
 // `mere -rv` grows its heap up in gp and its stack down in sp, and every
@@ -838,6 +904,10 @@ let rec drive = fn (n: int) ->
       else () in
     if vec_get st 1 == 1 then () else let _ = step mem x st in drive (n + 1);
 let _ = drive 0;
+let _ = if vec_get abi_on 0 == 1 then
+  print_err ("rvrun: ABI check: " ++ str_of_int (vec_get abi_hits 0)
+             ++ " violation(s), " ++ str_of_int (vec_get abi_n 0) ++ " frame(s) still open\n")
+else ();
 
 // Under `trace`, say where the guest has just been -- oldest first. Only on an
 // abnormal halt: a guest that exited on purpose has nothing to explain.
