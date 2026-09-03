@@ -109,6 +109,24 @@ let fd_used = new_vec fd_cap 0;
 let fd_base = new_vec fd_cap 0;
 let fd_len = new_vec fd_cap 0;
 let fd_pos = new_vec fd_cap 0;
+// A WRITE fd buffers everything and hands it to the host's write_file at
+// close, because Mere's file API is whole-file -- there is no descriptor to
+// pass through. The buffer is per-fd (a vec of byte-vecs), so two files open
+// for writing at once do not interleave; the path rides in fd_wpath so close
+// knows where the bytes go. fd_mode: 0 = read (snapshot cursor), 1 = write.
+let fd_mode = new_vec fd_cap 0;
+let fd_wpath = new_vec fd_cap "";
+// per-fd byte buffers, reused across opens: fd_wlen is the live length and the
+// vec is capacity -- a reopened slot writes over old bytes instead of popping
+// them (Mere's vec grows but does not shrink, and does not need to here).
+let fd_wlen = new_vec fd_cap 0;
+let fd_wbuf = vec_new ();
+let _ = (let rec go = fn i -> if i >= fd_cap then () else let _ = vec_push fd_wbuf (new_vec 0 0) in go (i + 1) in go 0);
+// stdin, slurped ONCE on the first read(0) and served as a cursor: the guest's
+// read_stdin drains it to EOF, and a second read_stdin correctly sees empty --
+// the same answer a real process gets. -1 in the pos cell means "not read yet".
+let stdin_pos = new_vec 1 (0 - 1);
+let stdin_buf = new_vec 1 "";
 // Closing rolls the arena back when the block was the last one allocated, which
 // is every close in a one-file-at-a-time reader -- without it a long `require`
 // chain exhausts the arena for files it is no longer holding.
@@ -131,9 +149,28 @@ let cstr_at = fn mem -> fn p ->
       if c == 0 then () else let _ = strbuf_push sb (chr c) in go (i + 1) in
   let _ = go 0 in
   strbuf_to_str sb;
-let sys_openat = fn mem -> fn pathp ->
+let sys_openat = fn mem -> fn pathp -> fn flags ->
   let path = cstr_at mem pathp in
+  let wr = bit_and flags 1 in                                          // O_WRONLY
   if str_len path >= path_max then 0 - 36                              // -ENAMETOOLONG
+  else if wr == 1 then
+    (let slot = fd_free fd_first in
+     if slot < 0 then 0 - 24                                           // -EMFILE
+     else
+       // O_CREAT|O_TRUNC means the file exists and is empty the moment open
+       // returns -- so DO that, now, with the host's write_file. It is also the
+       // path check: a directory that does not exist fails HERE, as -ENOENT the
+       // guest's try_or can catch, instead of at close where the buffered bytes
+       // have nowhere to go and an uncaught host fail would take the EMULATOR
+       // down -- reporting the guest's bad path as our crash.
+       let ok = try_or (fn (u: unit) -> let _ = write_file path "" in true) false in
+       if ok then
+         (let _ = vec_set fd_used slot 1 in
+          let _ = vec_set fd_mode slot 1 in
+          let _ = vec_set fd_wpath slot path in
+          let _ = vec_set fd_wlen slot 0 in
+          slot)
+       else 0 - 2)                                                     // -ENOENT
   else if file_exists path then
     let slot = fd_free fd_first in
     if slot < 0 then 0 - 24                                            // -EMFILE
@@ -155,8 +192,26 @@ let sys_openat = fn mem -> fn pathp ->
         slot
   else 0 - 2;                                                          // -ENOENT
 let fd_bad = fn fd -> fd < fd_first || fd >= fd_cap || vec_get fd_used fd == 0;
+// read(0): the guest asking for OUR stdin. Slurped once, then a cursor.
+let sys_read_stdin = fn mem -> fn buf -> fn cnt ->
+  let _ = (if vec_get stdin_pos 0 < 0 then
+             let _ = vec_set stdin_buf 0 (read_stdin ()) in
+             vec_set stdin_pos 0 0
+           else ()) in
+  let s = vec_get stdin_buf 0 in
+  let pos = vec_get stdin_pos 0 in
+  let left = str_len s - pos in
+  let n = if cnt < left then cnt else left in
+  let rec copy = fn i ->
+    if i >= n then () else
+      let _ = stb mem (buf + i) (ord (char_at s (pos + i))) in copy (i + 1) in
+  let _ = copy 0 in
+  let _ = vec_set stdin_pos 0 (pos + n) in
+  n;
 let sys_read = fn mem -> fn fd -> fn buf -> fn cnt ->
-  if fd_bad fd then 0 - 9                                              // -EBADF
+  if fd == 0 then sys_read_stdin mem buf cnt
+  else if fd_bad fd then 0 - 9                                         // -EBADF
+  else if vec_get fd_mode fd == 1 then 0 - 9                           // -EBADF: write fd
   else
     let pos = vec_get fd_pos fd in
     let left = vec_get fd_len fd - pos in
@@ -168,8 +223,40 @@ let sys_read = fn mem -> fn fd -> fn buf -> fn cnt ->
     let _ = copy 0 in
     let _ = vec_set fd_pos fd (pos + n) in
     n;
+// A guest write to one of our write fds: append to that fd's buffer. The
+// bytes land on the HOST at close, all at once, through write_file.
+let sys_write_fd = fn mem -> fn fd -> fn buf -> fn cnt ->
+  let b = vec_get fd_wbuf fd in
+  let pos = vec_get fd_wlen fd in
+  let rec go = fn i ->
+    if i >= cnt then () else
+      let byte = ldb mem (buf + i) in
+      let _ = (if pos + i < vec_len b then vec_set b (pos + i) byte
+               else vec_push b byte) in
+      go (i + 1) in
+  let _ = go 0 in
+  let _ = vec_set fd_wlen fd (pos + cnt) in
+  cnt;
 let sys_close = fn fd ->
   if fd_bad fd then 0 - 9                                              // -EBADF
+  else if vec_get fd_mode fd == 1 then
+    // the write fd's moment: everything buffered becomes the file, atomically
+    // from the guest's point of view. write_file replaces, which is the
+    // O_TRUNC the open promised.
+    let b = vec_get fd_wbuf fd in
+    let sb = strbuf_new () in
+    let n = vec_get fd_wlen fd in
+    let rec go = fn i ->
+      if i >= n then () else let _ = strbuf_push sb (chr (vec_get b i)) in go (i + 1) in
+    let _ = go 0 in
+    // The oracle's own shape: C's write_file checks the OPEN and ignores write
+    // and close errors after it (fwrite's count is discarded, fclose unchecked).
+    // So a failure here is swallowed to match -- but through try_or, because an
+    // uncaught host fail here would kill the emulator, not the guest.
+    let _ = try_or (fn (u: unit) -> let _ = write_file (vec_get fd_wpath fd) (strbuf_to_str sb) in true) false in
+    let _ = vec_set fd_mode fd 0 in
+    let _ = vec_set fd_used fd 0 in
+    0
   else
     let base = vec_get fd_base fd in
     let top = base + vec_get fd_len fd in
@@ -415,6 +502,11 @@ let step = fn mem -> fn x -> fn st ->
     else
       let a7 = vec_get x 17 in
       if a7 == 93 then halt st halt_exit
+      else if a7 == 64 && vec_get x 10 >= fd_first
+              && vec_get x 10 < fd_cap
+              && vec_get fd_used (vec_get x 10) == 1
+              && vec_get fd_mode (vec_get x 10) == 1 then     // write to a FILE
+        vec_set x 10 (sys_write_fd mem (vec_get x 10) (vec_get x 11) (vec_get x 12))
       else if a7 == 64 then                                            // write
         let buf = vec_get x 11 in
         let len = vec_get x 12 in
@@ -437,7 +529,7 @@ let step = fn mem -> fn x -> fn st ->
         let _ = st64 mem (ts + 8) nsec in
         vec_set x 10 0
       else if a7 == 56 then                                            // openat
-        vec_set x 10 (sys_openat mem (vec_get x 11))
+        vec_set x 10 (sys_openat mem (vec_get x 11) (vec_get x 12))
       else if a7 == 63 then                                            // read
         vec_set x 10 (sys_read mem (vec_get x 10) (vec_get x 11) (vec_get x 12))
       else if a7 == 57 then                                            // close
