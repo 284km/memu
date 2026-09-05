@@ -394,6 +394,115 @@ let take_trap = fn st -> fn cause -> fn tval -> fn pc ->
     let _ = vec_set csr csr_mtval tval in
     vec_set st 0 (bit_and tvec (bit_not 3));
 
+// --- RVV 1.0 subset (Q-110): VLEN = 128, LMUL = 1, SEW = e8, plus e16 only to read a
+// widening reduction. Enough for `mere -rv` to run the u8x16 operations the UTF-8
+// validator needs; everything else in OP-V traps as illegal, so a program that
+// leans on a wider subset says so instead of computing something quiet. ------------
+let vregs = new_vec 512 0;             // 32 registers x 16 bytes, one element per byte
+let vstate = new_vec 2 0;              // 0: vl, 1: vtype (the zimm as written)
+let vget = fn r -> fn i -> vec_get vregs (r * 16 + i);
+let vset = fn r -> fn i -> fn v -> vec_set vregs (r * 16 + i) (bit_and v 255);
+let vsew = fn () -> bit_and (bit_shr (vec_get vstate 1) 3) 7;              // 0 = e8, 1 = e16
+let mask_bit = fn r -> fn i -> bit_and (bit_shr (vget r (i / 8)) (i % 8)) 1;
+let set_mask_bit = fn r -> fn i -> fn b ->
+  let byte = vget r (i / 8) in
+  let m = bit_shl 1 (i % 8) in
+  vset r (i / 8) (if b == 1 then bit_or byte m else bit_and byte (255 - m));
+let sext5 = fn v -> if v >= 16 then v - 32 else v;
+// vsetvli / vsetivli: only m1 with e8 or e16 is a legal vtype here; vl = min(avl, VLMAX)
+let vsetvl = fn x -> fn st -> fn rd -> fn rs1 -> fn avl_imm -> fn vtype -> fn inst -> fn pc ->
+  let lmul = bit_and vtype 7 in
+  let sew = bit_and (bit_shr vtype 3) 7 in
+  if lmul != 0 || sew > 1 then take_trap st 2 inst pc
+  else
+    let vlmax = if sew == 1 then 8 else 16 in
+    let avl = if avl_imm >= 0 then avl_imm
+              else if rs1 != 0 then vec_get x rs1
+              else if rd != 0 then vlmax
+              else vec_get vstate 0 in
+    let vl = if avl > vlmax then vlmax else avl in
+    let _ = vec_set vstate 0 vl in
+    let _ = vec_set vstate 1 vtype in
+    wrx x rd vl;
+let vexec = fn mem -> fn x -> fn st -> fn inst -> fn pc -> fn op -> fn f3 -> fn rd -> fn rs1 -> fn rs2 -> fn a ->
+  let vl = vec_get vstate 0 in
+  let f6 = bit_and (bit_shr inst 26) 63 in
+  let vm = bit_and (bit_shr inst 25) 1 in
+  if op == 0x07 || op == 0x27 then                                   // vle8.v / vse8.v vd, (rs1)
+    if f6 != 0 || vm != 1 || rs2 != 0 then take_trap st 2 inst pc
+    else if in_ram mem a == false || in_ram mem (a + 15) == false then
+      take_trap st (if op == 0x07 then 5 else 7) a pc
+    else
+      let rec go = fn i ->
+        if i >= vl then ()
+        else
+          let _ = (if op == 0x07 then vset rd i (ldb mem (a + i)) else stb mem (a + i) (vget rd i)) in
+          go (i + 1) in
+      go 0
+  else if f3 == 7 then                                               // vsetvli / vsetivli
+    if bit_and (bit_shr inst 31) 1 == 0 then
+      vsetvl x st rd rs1 (0 - 1) (bit_and (bit_shr inst 20) 2047) inst pc
+    else if bit_and (bit_shr inst 30) 1 == 1 then
+      vsetvl x st rd 0 rs1 (bit_and (bit_shr inst 20) 1023) inst pc
+    else take_trap st 2 inst pc                                      // vsetvl rs2-form: not here
+  else if f3 == 0 || f3 == 3 || f3 == 4 then                         // OPIVV / OPIVI / OPIVX
+    let op2 = fn i -> if f3 == 0 then vget rs1 i
+                      else if f3 == 4 then bit_and a 255
+                      else bit_and (sext5 rs1) 255 in
+    let amount = if f3 == 4 then a else if f3 == 3 then rs1 else 0 in   // slides: the raw count
+    let rec each = fn i -> fn f ->
+      if i >= vl then () else let _ = vset rd i (f (vget rs2 i) (op2 i)) in each (i + 1) f in
+    if f6 == 0 then each 0 (fn s -> fn t -> s + t)                              // vadd
+    else if f6 == 2 then each 0 (fn s -> fn t -> s - t)                         // vsub
+    else if f6 == 9 then each 0 (fn s -> fn t -> bit_and s t)                   // vand
+    else if f6 == 10 then each 0 (fn s -> fn t -> bit_or s t)                   // vor
+    else if f6 == 11 then each 0 (fn s -> fn t -> bit_xor s t)                  // vxor
+    else if f6 == 34 then each 0 (fn s -> fn t -> if s > t then s - t else 0)   // vssubu
+    else if f6 == 40 then each 0 (fn s -> fn t -> bit_shr s (bit_and t 7))      // vsrl
+    else if f6 == 24 then                                                        // vmseq -> mask in vd
+      let rec m = fn i ->
+        if i >= vl then () else
+          let _ = set_mask_bit rd i (if vget rs2 i == op2 i then 1 else 0) in m (i + 1) in
+      m 0
+    else if f6 == 23 then                                                        // vmerge (v0 mask) / vmv.v
+      let rec m = fn i ->
+        if i >= vl then () else
+          let _ = vset rd i (if vm == 1 || mask_bit 0 i == 1 then op2 i else vget rs2 i) in m (i + 1) in
+      m 0
+    else if f6 == 12 && f3 == 0 then                                             // vrgather.vv: index >= VLMAX gives 0
+      let rec m = fn i ->
+        if i >= vl then () else
+          let j = vget rs1 i in
+          let _ = vset rd i (if j < 16 then vget rs2 j else 0) in m (i + 1) in
+      m 0
+    else if f6 == 14 && f3 != 0 then                                             // vslideup.vx / .vi: vd[i] = vs2[i-k], i >= k
+      let rec m = fn i ->
+        if i < amount then m (i + 1)
+        else if i >= vl then () else let _ = vset rd i (vget rs2 (i - amount)) in m (i + 1) in
+      m 0
+    else if f6 == 15 && f3 != 0 then                                             // vslidedown.vx / .vi: vd[i] = vs2[i+k] or 0
+      let rec m = fn i ->
+        if i >= vl then () else
+          let _ = vset rd i (if i + amount < 16 then vget rs2 (i + amount) else 0) in m (i + 1) in
+      m 0
+    else if f6 == 48 && f3 == 0 then                                             // vwredsumu.vs: e16 sum into vd[0]
+      let rec sum = fn i -> fn acc -> if i >= vl then acc else sum (i + 1) (acc + vget rs2 i) in
+      let s = sum 0 (vget rs1 0 + vget rs1 1 * 256) in
+      let _ = vset rd 0 (bit_and s 255) in
+      vset rd 1 (bit_and (bit_shr s 8) 255)
+    else take_trap st 2 inst pc
+  else if f3 == 2 then                                               // OPMVV
+    if f6 == 0 then                                                  // vredsum.vs (e8, wraps)
+      let rec sum = fn i -> fn acc -> if i >= vl then acc else sum (i + 1) (acc + vget rs2 i) in
+      vset rd 0 (sum 0 (vget rs1 0))
+    else if f6 == 2 then                                             // vredor.vs
+      let rec o = fn i -> fn acc -> if i >= vl then acc else o (i + 1) (bit_or acc (vget rs2 i)) in
+      vset rd 0 (o 0 (vget rs1 0))
+    else if f6 == 16 && rs1 == 0 then                                // vmv.x.s rd, vs2 (element 0, SEW wide)
+      wrx x rd (if vsew () == 1 then vget rs2 0 + vget rs2 1 * 256 else vget rs2 0)
+    else take_trap st 2 inst pc
+  else take_trap st 2 inst pc;
+
 let step = fn mem -> fn x -> fn st ->
   let pc = vec_get st 0 in
   if in_ram mem pc == false then take_trap st 1 pc pc else
@@ -606,6 +715,8 @@ let step = fn mem -> fn x -> fn st ->
         let _ = fill 0 in
         vec_set x 10 len
       else vec_set x 10 (0 - 38)                                       // -ENOSYS
+  else if op == 0x57 || ((op == 0x07 || op == 0x27) && f3 == 0) then          // RVV subset
+    vexec mem x st inst pc op f3 rd rs1 rs2 a
   else if op == 0x0F then ()                                           // FENCE
   else take_trap st 2 inst pc;
 

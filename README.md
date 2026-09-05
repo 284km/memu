@@ -74,6 +74,22 @@ backend and checks the three outputs agree:
 MERE=/path/to/mere sh verify.sh
 ```
 
+## RVV subset (vector extension)
+
+Both RISC-V cores in `riscv-runc/` implement a subset of the RISC-V Vector
+extension 1.0: VLEN = 128, LMUL = 1, SEW = e8 (plus e16 only to read a widening
+reduction). It is what `mere -rv` emits for the language's `u8x16` type --
+`vsetvli` / `vsetivli`, `vle8.v` / `vse8.v`, `vadd` / `vsub` / `vand` / `vor` /
+`vxor` / `vssubu` / `vsrl` / `vmseq` / `vmerge` / `vmv.v` / `vrgather` /
+`vslideup` / `vslidedown` / `vredsum` / `vredor` / `vwredsumu` / `vmv.x.s`.
+Anything else in OP-V traps as an illegal instruction, so a program that needs
+more says so.
+
+`riscv-runc/rvv_check.sh` runs directed tests three ways -- a Python model of
+each instruction, this emulator, and QEMU (`-cpu rv32,v=true,vlen=128`) when
+`qemu-system-riscv32` is installed -- and requires the sixteen result bytes to
+agree. Fourteen programs at the time of writing, all three parties agreeing.
+
 ## Scope
 
 These are **CPU cores**, not full machines. There is no graphics/PPU, no sound,
