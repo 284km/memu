@@ -82,6 +82,9 @@ t("vwredsumu.vs -> e16", [vle8(1, X10), vi(23, 5, 0, 0), vv(48, 3, 1, 5), vsetiv
 t("vredor.vs", [vle8(1, X10), vi(23, 5, 0, 0), mvv(2, 3, 1, 5), mvv(16, X7, 3, 0), sb(X7, X13, 0)],
   bytes([eval("|".join(str(a) for a in A))]), out_bytes=1)
 t("vmv.v.x splat", [addi(X6, 0, 0x5a), vx(23, 3, 0, X6), vse8(3, X13)], bytes([0x5a] * 16))
+# a reserved encoding: vrgather with vd overlapping vs2 traps on QEMU; memu must trap too,
+# so neither reaches the UART and both produce no bytes
+t("vrgather.vv vd == vs2 traps", [vle8(1, X10), vle8(2, X12), vv(12, 1, 1, 2), vse8(1, X13)], b"", out_bytes=0)
 
 def build(body, data, rv64=False):
     ws = program(body, 16, rv64=rv64)
@@ -110,8 +113,57 @@ def run_qemu(img, out_bytes):
             return b"", "qemu timed out"
         return p.stdout[:out_bytes], p.stderr.decode(errors="replace")
 
+def fuzz(cores, n, seed=20260905):
+    """Random sequences of the subset's operations over random data, memu against
+    QEMU (the independent oracle; no Python model here). The result is v3
+    stored at x13 after every step, so a divergence names the step."""
+    import random
+    rng = random.Random(seed)
+    q = shutil.which("qemu-system-riscv32")
+    if not q:
+        print("rvv_check --fuzz: SKIP -- qemu-system-riscv32 not found (QEMU is the oracle here)"); return 0
+    ops = ["vadd", "vsub", "vand", "vor", "vxor", "vssubu", "vsrl", "vmseq", "vrgather", "vslidedown", "vslideup", "vmv.v.x", "vmerge"]
+    fails = 0
+    for t in range(n):
+        d = {0x00: bytes(rng.randrange(256) for _ in range(16)), 0x10: bytes(rng.randrange(256) for _ in range(16)),
+             0x20: bytes(rng.randrange(20) for _ in range(16))}           # 0x20: mostly valid gather indices
+        body = [vle8(1, X10), vle8(2, X11), vle8(4, X12)]
+        k = rng.randrange(1, 7)
+        for _ in range(k):
+            op = rng.choice(ops); vd = 3; vs2 = rng.choice([1, 2, 3, 4]); vs1 = rng.choice([1, 2, 3, 4])
+            if op == "vadd": body.append(vv(0, vd, vs2, vs1))
+            elif op == "vsub": body.append(vv(2, vd, vs2, vs1))
+            elif op == "vand": body.append(vv(9, vd, vs2, vs1))
+            elif op == "vor": body.append(vv(10, vd, vs2, vs1))
+            elif op == "vxor": body.append(vv(11, vd, vs2, vs1))
+            elif op == "vssubu": body.append(vv(34, vd, vs2, vs1))
+            elif op == "vsrl": body += [addi(X6, 0, rng.randrange(8)), vx(40, vd, vs2, X6)]
+            elif op == "vmseq": body += [vv(24, 0, vs2, vs1), vi(23, 5, 0, 0), vi(23, vd, 5, -1, vm=0)]
+            # vrgather and vslideup reserve a destination that overlaps a source (QEMU
+            # raises illegal); the generator keeps to legal programs, memu traps the rest
+            elif op == "vrgather": body.append(vv(12, vd, vs2 if vs2 != vd else 1, 4 if vs1 == vd else vs1))
+            elif op == "vslidedown": body.append(vi(15, vd, vs2 if vs2 != vd else 1, rng.randrange(17)))
+            elif op == "vslideup": body.append(vi(14, vd, vs2 if vs2 != vd else 1, rng.randrange(17)))
+            elif op == "vmv.v.x": body += [addi(X6, 0, rng.randrange(256)), vx(23, vd, 0, X6)]
+            elif op == "vmerge": body += [vv(24, 0, 1, 2), vi(23, vd, vs2 if vs2 != 0 else 1, rng.randrange(-16, 16), vm=0)]
+        body.append(vse8(3, X13))
+        img = build(body, {0x20: d[0x20]}); img = bytearray(img); img[0x1000:0x1010] = d[0x00]; img[0x1010:0x1020] = d[0x10]; img = bytes(img)
+        img64 = bytearray(build(body, {0x20: d[0x20]}, rv64=True)); img64[0x1000:0x1010] = d[0x00]; img64[0x1010:0x1020] = d[0x10]; img64 = bytes(img64)
+        qgot, qerr = run_qemu(img, 16)
+        for core in cores:
+            got, err = run_memu(core, img64 if "64" in os.path.basename(core) else img, 16)
+            if got != qgot:
+                fails += 1
+                print(f"  FAIL  fuzz #{t} ({os.path.basename(core)}): memu {got.hex()} qemu {qgot.hex()}  words={[hex(w) for w in body]}")
+    print(f"rvv_check --fuzz: {n} random programs x {len(cores)} core(s) against QEMU, {fails} divergence(s)")
+    return fails
+
 def main():
-    cores = sys.argv[1:]
+    cores = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if "--fuzz" in sys.argv:
+        n = int(sys.argv[sys.argv.index("--fuzz") + 1]) if sys.argv.index("--fuzz") + 1 < len(sys.argv) and sys.argv[sys.argv.index("--fuzz") + 1].isdigit() else 200
+        cores = [a for a in cores if not a.isdigit()]
+        sys.exit(1 if fuzz(cores, n) else 0)
     if not cores: print(__doc__); sys.exit(2)
     fails = 0; ran = 0
     for name, body, expect, nout, data in tests:

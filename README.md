@@ -88,7 +88,11 @@ more says so.
 `riscv-runc/rvv_check.sh` runs directed tests three ways -- a Python model of
 each instruction, this emulator, and QEMU (`-cpu rv32,v=true,vlen=128`) when
 `qemu-system-riscv32` is installed -- and requires the sixteen result bytes to
-agree. Fourteen programs at the time of writing, all three parties agreeing.
+agree. Fifteen programs at the time of writing, all three parties agreeing.
+`rvv_check.py <cores> --fuzz 200` adds random legal sequences of the subset's
+operations over random data, memu against QEMU alone: the first run found that
+memu computed `vrgather` and `vslideup` with a destination overlapping a source,
+which the specification reserves and QEMU refuses; both cores trap there now.
 
 ## Scope
 

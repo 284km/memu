@@ -522,12 +522,15 @@ let vexec = fn mem -> fn x -> fn st -> fn inst -> fn pc -> fn op -> fn f3 -> fn 
           let _ = vset rd i (if vm == 1 || mask_bit 0 i == 1 then op2 i else vget rs2 i) in m (i + 1) in
       m 0
     else if f6 == 12 && f3 == 0 then                                             // vrgather.vv: index >= VLMAX gives 0
+      // vd overlapping vs1 or vs2 is a reserved encoding: QEMU raises illegal, so do we
+      if rd == rs1 || rd == rs2 then take_trap st 2 inst pc else
       let rec m = fn i ->
         if i >= vl then () else
           let j = vget rs1 i in
           let _ = vset rd i (if j < 16 then vget rs2 j else 0) in m (i + 1) in
       m 0
     else if f6 == 14 && f3 != 0 then                                             // vslideup.vx / .vi: vd[i] = vs2[i-k], i >= k
+      if rd == rs2 then take_trap st 2 inst pc else                                // reserved overlap, as on QEMU
       let rec m = fn i ->
         if i < amount then m (i + 1)
         else if i >= vl then () else let _ = vset rd i (vget rs2 (i - amount)) in m (i + 1) in
