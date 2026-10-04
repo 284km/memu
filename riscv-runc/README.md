@@ -184,3 +184,27 @@ The emulator takes an optional RAM size in MB (`./rvrun 20`), defaulting to 8, a
 `mere -rv` output, whose stack starts at the top of RAM: see
 [`../riscv-mere`](../riscv-mere). There is no instruction budget — the guest
 runs until it halts, so Ctrl-C is the way out of a runaway program.
+
+## Profiling a guest
+
+The 64-bit core takes `prof` (before the `--` that starts the guest's own
+arguments): every 997th instruction it counts the PC, and at exit it writes each
+nonzero count to stderr as `rvprof <pc> <count>`. [`rvprof.awk`](rvprof.awk)
+charges those samples to functions through the compiler's debug map:
+
+```sh
+mere -rv64 --ram 256 prog.mere > prog.bin
+mere -rv64g --ram 256 prog.mere > prog.map     # same flags as the binary
+./rvrun64 256 prof -- script.rb 2> prof.txt
+awk -f rvprof.awk prog.map prof.txt | head -20
+```
+
+The interval is a prime so that a loop's period does not alias with it. The
+counts table (one slot per instruction word of a 16 MB image) exists only when
+`prof` is given; without it the core runs as before. The map has to describe
+the same binary -- Mere's did not until v0.1.610, and a profile read through
+the old one blamed the wrong functions.
+
+This is how the RISC-V Map was found to be the cost of a Ruby interpreter
+running here: 64% of its startup, and 85-98% of the scripts that timed out,
+were assoc-list walks (Mere v0.1.611 made it a hash table).

@@ -795,6 +795,20 @@ let rec find_abi = fn l ->
   | Nil -> 0
   | Cons (s, rest) -> if str_eq s "abi" then 1 else find_abi rest;
 let _ = vec_set abi_on 0 (find_abi (args ()));
+// `prof`: a sampling profile of the guest. Every 997th instruction (a prime, so
+// a loop's period does not alias with it) the PC's word index is counted, and at
+// exit each nonzero count is written to stderr as `rvprof <pc> <count>`.
+// rvprof.awk folds that into functions through the compiler's debug map
+// (`mere -rv64g`). The table exists only when asked for: 4M slots, one per
+// instruction word of a 16 MB image.
+let rec find_prof = fn l ->
+  match l with
+  | Nil -> 0
+  | Cons (s, rest) -> if str_eq s "--" then 0 else if str_eq s "prof" then 1 else find_prof rest;
+let prof_on = find_prof (args ());
+let prof_slots = 4194304;
+let prof_hist = new_vec (if prof_on == 1 then prof_slots else 1) 0;
+let prof_tick = new_vec 1 0;
 let icount = new_vec 1 0;
 let trace_every = 100000000;
 let ring = new_vec 16 0;
@@ -816,6 +830,15 @@ let rec drive = fn (n: int) ->
   if vec_get st 1 == 1 then ()
   else
     let _ = vec_set timer 0 (vec_get timer 0 + 1) in
+    let _ =
+      if prof_on == 1 then
+        (let t = vec_get prof_tick 0 + 1 in
+         if t >= 997 then
+           (let _ = vec_set prof_tick 0 0 in
+            let i = bit_shr (vec_get st 0) 2 in
+            if i >= 0 && i < prof_slots then vec_set prof_hist i (vec_get prof_hist i + 1) else ())
+         else vec_set prof_tick 0 t)
+      else () in
     let _ =
       if timer_pending () == 1 then
         let _ = vec_set csr csr_mip (bit_or (vec_get csr csr_mip) 128) in
@@ -846,6 +869,13 @@ let rec drive = fn (n: int) ->
       else () in
     if vec_get st 1 == 1 then () else let _ = step mem x st in drive (n + 1);
 let _ = drive 0;
+let rec prof_dump = fn (i: int) ->
+  if i >= prof_slots then ()
+  else
+    let c = vec_get prof_hist i in
+    let _ = (if c > 0 then print_err ("rvprof " ++ str_of_int (i * 4) ++ " " ++ str_of_int c ++ "\n") else ()) in
+    prof_dump (i + 1);
+let _ = if prof_on == 1 then prof_dump 0 else ();
 let _ = if vec_get abi_on 0 == 1 then
   print_err ("rvrun: ABI check: " ++ str_of_int (vec_get abi_hits 0)
              ++ " violation(s), " ++ str_of_int (vec_get abi_n 0) ++ " frame(s) still open\n")
