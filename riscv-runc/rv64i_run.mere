@@ -815,6 +815,18 @@ let rec find_prof = fn l ->
 let prof_on = find_prof (args ());
 let prof_slots = 4194304;
 let prof_hist = new_vec (if prof_on == 1 then prof_slots else 1) 0;
+// `aprof`: where the guest allocates. After each instruction that raised gp
+// (the bump pointer of a Mere guest) by less than 64 MB -- a larger step is a
+// jump to another heap, not an allocation -- the bytes are charged to its PC,
+// and at exit each nonzero total is written as `rvaprof <pc> <bytes>`, which
+// rvaprof.awk folds into functions as rvprof.awk does. Every instruction is
+// counted, so it is slower than `prof`.
+let rec find_aprof = fn l ->
+  match l with
+  | Nil -> 0
+  | Cons (s, rest) -> if str_eq s "--" then 0 else if str_eq s "aprof" then 1 else find_aprof rest;
+let aprof_on = find_aprof (args ());
+let aprof_hist = new_vec (if aprof_on == 1 then prof_slots else 1) 0;
 let prof_tick = new_vec 1 0;
 let icount = new_vec 1 0;
 let trace_every = 100000000;
@@ -874,7 +886,18 @@ let rec drive = fn (n: int) ->
                    ++ " free=" ++ str_of_int (sp - gp) ++ "\n")
         else ()
       else () in
-    if vec_get st 1 == 1 then () else let _ = step mem x st in drive (n + 1);
+    if vec_get st 1 == 1 then ()
+    else if aprof_on == 1 then
+      (let g0 = vec_get x 3 in
+       let pc0 = vec_get st 0 in
+       let _ = step mem x st in
+       let g1 = vec_get x 3 in
+       let _ = (if g1 > g0 && g1 - g0 < 67108864 then
+                  (let i = bit_shr pc0 2 in
+                   if i >= 0 && i < prof_slots then vec_set aprof_hist i (vec_get aprof_hist i + (g1 - g0)) else ())
+                else ()) in
+       drive (n + 1))
+    else let _ = step mem x st in drive (n + 1);
 let _ = drive 0;
 let rec prof_dump = fn (i: int) ->
   if i >= prof_slots then ()
@@ -883,6 +906,13 @@ let rec prof_dump = fn (i: int) ->
     let _ = (if c > 0 then print_err ("rvprof " ++ str_of_int (i * 4) ++ " " ++ str_of_int c ++ "\n") else ()) in
     prof_dump (i + 1);
 let _ = if prof_on == 1 then prof_dump 0 else ();
+let rec aprof_dump = fn (i: int) ->
+  if i >= prof_slots then ()
+  else
+    let c = vec_get aprof_hist i in
+    let _ = (if c > 0 then print_err ("rvaprof " ++ str_of_int (i * 4) ++ " " ++ str_of_int c ++ "\n") else ()) in
+    aprof_dump (i + 1);
+let _ = if aprof_on == 1 then aprof_dump 0 else ();
 let _ = if vec_get abi_on 0 == 1 then
   print_err ("rvrun: ABI check: " ++ str_of_int (vec_get abi_hits 0)
              ++ " violation(s), " ++ str_of_int (vec_get abi_n 0) ++ " frame(s) still open\n")
