@@ -709,6 +709,13 @@ let step = fn mem -> fn x -> fn st ->
         vec_set x 10 (sys_close (vec_get x 10))
       else if a7 == 48 then                                            // faccessat
         vec_set x 10 (if file_exists (cstr_at mem (vec_get x 11)) then 0 else 0 - 2)
+      else if a7 == 35 then                                            // unlinkat
+        // flags 0 only: a file, never a directory (AT_REMOVEDIR is refused
+        // as unlink refuses one). The host's reason is not carried back --
+        // Mere's file_delete answers yes or no -- so a refusal is -EACCES.
+        vec_set x 10 (if vec_get x 12 != 0 then 0 - 22
+                      else if file_delete (cstr_at mem (vec_get x 11)) then 0
+                      else if file_exists (cstr_at mem (vec_get x 11)) then 0 - 13 else 0 - 2)
       else if a7 == 278 then                                           // getrandom
         let buf = vec_get x 10 in
         let len = vec_get x 11 in
