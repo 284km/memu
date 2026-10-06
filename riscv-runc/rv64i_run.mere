@@ -193,6 +193,38 @@ let sys_openat = fn mem -> fn pathp -> fn flags ->
         slot
   else 0 - 2;                                                          // -ENOENT
 let fd_bad = fn fd -> fd < fd_first || fd >= fd_cap || vec_get fd_used fd == 0;
+// newfstatat, from the host's stat through the C runtime's file_stat device
+// (Mere's extern ABI cannot name a struct stat): the 128 bytes of Linux's
+// riscv64 struct stat -- on both widths, a contract of this emulator's, since
+// rv32 Linux has only statx -- little-endian, the padding zero.
+extern fn getpid: unit -> int;
+extern fn access: str -> int -> int;
+extern fn file_stat: str -> int;
+extern fn file_lstat: str -> int;
+extern fn file_stat_field: int -> int;
+let sys_fstatat = fn mem -> fn pathp -> fn buf -> fn flags ->
+  let p = cstr_at mem pathp in
+  let r = if bit_and flags 256 != 0 then file_lstat p else file_stat p in
+  if r < 0 then (if file_exists p then 0 - 13 else 0 - 2)
+  else
+    let rec zero = fn i -> if i >= 128 then () else let _ = stb mem (buf + i) 0 in zero (i + 1) in
+    let _ = zero 0 in
+    let rec le = fn off -> fn v -> fn n ->
+      if n == 0 then () else let _ = stb mem (buf + off) (bit_and v 255) in le (off + 1) (bit_shr v 8) (n - 1) in
+    let _ = le 0 (file_stat_field 0) 8 in
+    let _ = le 8 (file_stat_field 1) 8 in
+    let _ = le 16 (file_stat_field 2) 4 in
+    let _ = le 20 (file_stat_field 3) 4 in
+    let _ = le 24 (file_stat_field 4) 4 in
+    let _ = le 28 (file_stat_field 5) 4 in
+    let _ = le 32 (file_stat_field 6) 8 in
+    let _ = le 48 (file_stat_field 7) 8 in
+    let _ = le 56 (file_stat_field 11) 4 in
+    let _ = le 64 (file_stat_field 12) 8 in
+    let _ = le 72 (file_stat_field 8) 8 in
+    let _ = le 88 (file_stat_field 9) 8 in
+    let _ = le 104 (file_stat_field 10) 8 in
+    0;
 // A DIRECTORY opened with O_DIRECTORY (fd_mode 2) is a snapshot too: its names
 // (Mere's dir_entries, with "." and ".." in front as the kernel gives them),
 // laid out once as linux_dirent64 records -- u64 ino, s64 off, u16 reclen,
@@ -779,7 +811,16 @@ let step = fn mem -> fn x -> fn st ->
       else if a7 == 57 then                                            // close
         vec_set x 10 (sys_close (vec_get x 10))
       else if a7 == 48 then                                            // faccessat
-        vec_set x 10 (if file_exists (cstr_at mem (vec_get x 11)) then 0 else 0 - 2)
+        // the mode is the host's access(2)'s to answer (R 4 / W 2 / X 1); a
+        // path that is there and refused is -EACCES
+        let p = cstr_at mem (vec_get x 11) in
+        let m = vec_get x 12 in
+        vec_set x 10 (if (if file_exists p then false else true) then 0 - 2
+                      else if m == 0 then 0
+                      else if access p m == 0 then 0 else 0 - 13)
+      else if a7 == 172 then vec_set x 10 (getpid ())             // getpid
+      else if a7 == 79 then                                            // newfstatat
+        vec_set x 10 (sys_fstatat mem (vec_get x 11) (vec_get x 12) (vec_get x 13))
       else if a7 == 61 then                                            // getdents64
         vec_set x 10 (sys_getdents mem (vec_get x 10) (vec_get x 11) (vec_get x 12))
       else if a7 == 34 then                                            // mkdirat
