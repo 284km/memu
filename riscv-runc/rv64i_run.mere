@@ -153,6 +153,7 @@ let sys_openat = fn mem -> fn pathp -> fn flags ->
   let path = cstr_at mem pathp in
   let wr = bit_and flags 1 in                                          // O_WRONLY
   if str_len path >= path_max then 0 - 36                              // -ENAMETOOLONG
+  else if bit_and flags 65536 != 0 then sys_opendir path               // O_DIRECTORY
   else if wr == 1 then
     (let slot = fd_free fd_first in
      if slot < 0 then 0 - 24                                           // -EMFILE
@@ -192,6 +193,74 @@ let sys_openat = fn mem -> fn pathp -> fn flags ->
         slot
   else 0 - 2;                                                          // -ENOENT
 let fd_bad = fn fd -> fd < fd_first || fd >= fd_cap || vec_get fd_used fd == 0;
+// A DIRECTORY opened with O_DIRECTORY (fd_mode 2) is a snapshot too: its names
+// (Mere's dir_entries, with "." and ".." in front as the kernel gives them),
+// laid out once as linux_dirent64 records -- u64 ino, s64 off, u16 reclen,
+// u8 type, the name and its NUL, padded to 8 -- for getdents64 to hand out
+// whole. The ino is the position (no host inode reaches here) and the type
+// DT_UNKNOWN, which a reader must be ready for on any filesystem.
+let rec split_nul = fn s -> fn i -> fn start -> fn acc ->
+  if i >= str_len s then acc
+  else if ord (char_at s i) == 0 then split_nul s (i + 1) (i + 1) (Cons (substring s start i, acc))
+  else split_nul s (i + 1) start acc;
+let rec rev_onto = fn l -> fn acc -> match l with Nil -> acc | Cons (h, t) -> rev_onto t (Cons (h, acc));
+let sys_opendir = fn path ->
+  if (if file_exists path then false else true) then 0 - 2               // -ENOENT
+  else if (if file_exists (path ++ "/.") then false else true) then 0 - 20 // -ENOTDIR
+  else
+    let slot = fd_free fd_first in
+    if slot < 0 then 0 - 24                                              // -EMFILE
+    else
+      let names = Cons (".", Cons ("..", rev_onto (split_nul (dir_entries path) 0 0 Nil) Nil)) in
+      let base = vec_get fbuf_top 0 in
+      let rec lay = fn l -> fn at -> fn k ->
+        match l with
+        | Nil -> at
+        | Cons (nm, rest) ->
+          let n = str_len nm in
+          let reclen = bit_and (19 + n + 1 + 7) (0 - 8) in
+          if at + reclen > fbuf_cap then 0 - 1 else
+          let rec zero = fn i -> if i >= reclen then () else let _ = vec_set fbuf (at + i) 0 in zero (i + 1) in
+          let _ = zero 0 in
+          let rec le = fn off -> fn v -> fn k2 ->
+            if k2 == 0 then () else let _ = vec_set fbuf (at + off) (bit_and v 255) in le (off + 1) (bit_shr v 8) (k2 - 1) in
+          let _ = le 0 (k + 1) 8 in
+          let _ = le 8 (k + 1) 8 in
+          let _ = le 16 reclen 2 in
+          let rec name = fn i -> if i >= n then () else let _ = vec_set fbuf (at + 19 + i) (ord (char_at nm i)) in name (i + 1) in
+          let _ = name 0 in
+          lay rest (at + reclen) (k + 1) in
+      let top = lay names base 0 in
+      if top < 0 then 0 - 12                                             // -ENOMEM
+      else
+        let _ = vec_set fbuf_top 0 top in
+        let _ = vec_set fd_used slot 1 in
+        let _ = vec_set fd_mode slot 2 in
+        let _ = vec_set fd_base slot base in
+        let _ = vec_set fd_len slot (top - base) in
+        let _ = vec_set fd_pos slot 0 in
+        slot;
+// getdents64: whole records from the cursor, as many as fit in cnt; 0 at the
+// end; -EINVAL when not even the next one fits
+let sys_getdents = fn mem -> fn fd -> fn buf -> fn cnt ->
+  if fd_bad fd then 0 - 9                                                // -EBADF
+  else if vec_get fd_mode fd != 2 then 0 - 20                            // -ENOTDIR
+  else
+    let base = vec_get fd_base fd in
+    let len = vec_get fd_len fd in
+    let rec take = fn pos -> fn got ->
+      if pos >= len then got
+      else
+        let reclen = vec_get fbuf (base + pos + 16) + 256 * vec_get fbuf (base + pos + 17) in
+        if got + reclen > cnt then got
+        else
+          let rec copy = fn i -> if i >= reclen then () else let _ = stb mem (buf + got + i) (vec_get fbuf (base + pos + i)) in copy (i + 1) in
+          let _ = copy 0 in
+          take (pos + reclen) (got + reclen) in
+    let pos0 = vec_get fd_pos fd in
+    let got = take pos0 0 in
+    if got == 0 && pos0 < len then 0 - 22                                // -EINVAL
+    else (let _ = vec_set fd_pos fd (pos0 + got) in got);
 // read(0): the guest asking for OUR stdin. Slurped once, then a cursor.
 let sys_read_stdin = fn mem -> fn buf -> fn cnt ->
   let _ = (if vec_get stdin_pos 0 < 0 then
@@ -212,6 +281,7 @@ let sys_read = fn mem -> fn fd -> fn buf -> fn cnt ->
   if fd == 0 then sys_read_stdin mem buf cnt
   else if fd_bad fd then 0 - 9                                         // -EBADF
   else if vec_get fd_mode fd == 1 then 0 - 9                           // -EBADF: write fd
+  else if vec_get fd_mode fd == 2 then 0 - 21                          // -EISDIR
   else
     let pos = vec_get fd_pos fd in
     let left = vec_get fd_len fd - pos in
@@ -261,6 +331,7 @@ let sys_close = fn fd ->
     let base = vec_get fd_base fd in
     let top = base + vec_get fd_len fd in
     let _ = if top == vec_get fbuf_top 0 then vec_set fbuf_top 0 base else () in
+    let _ = vec_set fd_mode fd 0 in
     let _ = vec_set fd_used fd 0 in
     0;
 
@@ -709,11 +780,24 @@ let step = fn mem -> fn x -> fn st ->
         vec_set x 10 (sys_close (vec_get x 10))
       else if a7 == 48 then                                            // faccessat
         vec_set x 10 (if file_exists (cstr_at mem (vec_get x 11)) then 0 else 0 - 2)
+      else if a7 == 61 then                                            // getdents64
+        vec_set x 10 (sys_getdents mem (vec_get x 10) (vec_get x 11) (vec_get x 12))
+      else if a7 == 34 then                                            // mkdirat
+        // Mere's dir_create; the host's errno is not carried here, so a
+        // refusal is told apart only as "something is there" or not
+        let p = cstr_at mem (vec_get x 11) in
+        vec_set x 10 (if dir_create p (vec_get x 12) == 0 then 0
+                      else if file_exists p then 0 - 17 else 0 - 2)
       else if a7 == 35 then                                            // unlinkat
         // flags 0 only: a file, never a directory (AT_REMOVEDIR is refused
         // as unlink refuses one). The host's reason is not carried back --
         // Mere's file_delete answers yes or no -- so a refusal is -EACCES.
-        vec_set x 10 (if vec_get x 12 != 0 then 0 - 22
+        // AT_REMOVEDIR (v0.1.630 of the compiler): Mere's dir_remove; a refusal
+        // with the directory still there is -ENOTEMPTY, the usual reason
+        vec_set x 10 (if vec_get x 12 == 512 then
+                        (if dir_remove (cstr_at mem (vec_get x 11)) == 0 then 0
+                         else if file_exists (cstr_at mem (vec_get x 11)) then 0 - 39 else 0 - 2)
+                      else if vec_get x 12 != 0 then 0 - 22
                       else if file_delete (cstr_at mem (vec_get x 11)) then 0
                       else if file_exists (cstr_at mem (vec_get x 11)) then 0 - 13 else 0 - 2)
       else if a7 == 278 then                                           // getrandom
@@ -773,6 +857,23 @@ let _ =
         let _ = st64 mem (argv_base + 16 + i * 8) at in
         lay (i + 1) (put_str at a) rest in
     lay 0 (argv_base + 16 + gn * 8) guest_args;
+// --- the environment block (v0.1.630 of the compiler reads it) ---------------
+// 12 KB above the argument block's start, the second half of its 24 KB: magic
+// "ENVP", the length, then the host's environment as `env -0` frames it --
+// K=V and a NUL each. Whole variables that do not fit are left out.
+let envp_base = argv_base + 0x3000;
+let envp_room = 0x3000 - 16;
+let _ =
+  let e = env_pairs () in
+  let rec fit = fn i -> fn last ->
+    if i >= str_len e || i >= envp_room then last
+    else if ord (char_at e i) == 0 then fit (i + 1) (i + 1)
+    else fit (i + 1) last in
+  let n = if str_len e <= envp_room then str_len e else fit 0 0 in
+  let _ = st64 mem envp_base 0x50564E45 in
+  let _ = st64 mem (envp_base + 8) n in
+  let rec put = fn i -> if i >= n then () else let _ = stb mem (envp_base + 16 + i) (ord (char_at e i)) in put (i + 1) in
+  put 0;
 
 let _ = vec_set x 2 (dram_base + 0x70000);
 let _ = vec_set st 0 dram_base;
