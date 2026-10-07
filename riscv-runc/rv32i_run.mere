@@ -241,6 +241,8 @@ let host_r = fn r -> if r < 0 then 0 - lin_errno (fd_last_errno ()) else r;
 // string), and this emulator printed every other write -- programs built
 // before v0.1.634 still do that, and still print.
 let hfd_cap = 4096;
+// the status the guest's exit (93) asked for; the emulator ends with it
+let guest_status = new_vec 1 0;
 let hfd = new_vec hfd_cap 0;
 let hfd_is = fn fd -> fd > 2 && fd < hfd_cap && vec_get hfd fd == 1;
 let hfd_keep = fn r -> let _ = (if r > 2 && r < hfd_cap then vec_set hfd r 1 else ()) in r;
@@ -914,7 +916,12 @@ let step = fn mem -> fn x -> fn st ->
       take_trap st 11 0 pc
     else                                                             // ECALL / EBREAK
       let a7 = vec_get x 17 in                                       // syscall number
-      if a7 == 93 then halt st halt_exit                             // exit -> halt
+      if a7 == 93 then
+        // v0.1.637 of the compiler: the guest's status is this process's
+        let _ = vec_set guest_status 0 (bit_and (vec_get x 10) 255) in
+        halt st halt_exit                             // exit -> halt
+      else if a7 == 64 && vec_get x 10 == 2 then                       // write: stderr is the host's
+        vec_set x 10 (host_write mem 2 (vec_get x 11) (vec_get x 12) 0)
       else if a7 == 64 && hfd_is (vec_get x 10) then                   // write: the host's fd
         vec_set x 10 (host_write mem (vec_get x 10) (vec_get x 11) (vec_get x 12) 0)
       else if a7 == 64 then                                          // write(fd, buf, len)
@@ -1416,4 +1423,7 @@ let _ = if why == halt_exit then () else
         else "no reason recorded (a halt that predates this message)") ++ "\n");
 // exit explicitly so the runtime doesn't echo this program's own final value
 // after the emulated program's output.
-exit 0
+// v0.1.637 of the compiler: with the status the guest's exit asked for (a
+// failure exits 1, as it does on every other backend); a halt for any other
+// reason ends 0, as it always has
+exit (if why == halt_exit then vec_get guest_status 0 else 0)
