@@ -202,6 +202,8 @@ extern fn access: str -> int -> int;
 extern fn file_stat: str -> int;
 extern fn file_lstat: str -> int;
 extern fn file_stat_field: int -> int;
+extern fn chdir: str -> int;
+extern fn file_chmod: str -> int -> int;
 let sys_fstatat = fn mem -> fn pathp -> fn buf -> fn flags ->
   let p = cstr_at mem pathp in
   let r = if bit_and flags 256 != 0 then file_lstat p else file_stat p in
@@ -819,6 +821,26 @@ let step = fn mem -> fn x -> fn st ->
                       else if m == 0 then 0
                       else if access p m == 0 then 0 else 0 - 13)
       else if a7 == 172 then vec_set x 10 (getpid ())             // getpid
+      else if a7 == 17 then                                            // getcwd
+        // the host's own (Mere v0.1.633's proc_cwd), the length with its
+        // NUL as Linux answers, -ERANGE when the buffer is short
+        let c = proc_cwd () in
+        let buf = vec_get x 10 in
+        let n = str_len c in
+        if n + 1 > vec_get x 11 then vec_set x 10 (0 - 34)
+        else
+          let rec put = fn i -> if i >= n then () else let _ = stb mem (buf + i) (ord (char_at c i)) in put (i + 1) in
+          let _ = put 0 in
+          let _ = stb mem (buf + n) 0 in
+          vec_set x 10 (n + 1)
+      else if a7 == 49 then                                            // chdir
+        // the emulator's own directory moves: every path the guest names
+        // after this is resolved from there, as the kernel would
+        let p = cstr_at mem (vec_get x 10) in
+        vec_set x 10 (if chdir p == 0 then 0 else if file_exists p then 0 - 20 else 0 - 2)
+      else if a7 == 53 then                                            // fchmodat
+        let p = cstr_at mem (vec_get x 11) in
+        vec_set x 10 (if file_chmod p (vec_get x 12) == 0 then 0 else if file_exists p then 0 - 1 else 0 - 2)
       else if a7 == 79 then                                            // newfstatat
         vec_set x 10 (sys_fstatat mem (vec_get x 11) (vec_get x 12) (vec_get x 13))
       else if a7 == 61 then                                            // getdents64
