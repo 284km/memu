@@ -193,6 +193,80 @@ let sys_openat = fn mem -> fn pathp -> fn flags ->
         slot
   else 0 - 2;                                                          // -ENOENT
 let fd_bad = fn fd -> fd < fd_first || fd >= fd_cap || vec_get fd_used fd == 0;
+// --- the host's descriptors (v0.1.634 of the compiler) ------------------------
+// Every open but a directory's is the host's own descriptor, handed to the
+// guest as it is: a write is in the file at once (File#sync, then File.read,
+// before the close), a pipe is a pipe, a seek is a seek. Bytes cross through
+// the C runtime's byte arena, 64 KB at a time. The guest's stdin, stdout and
+// stderr keep their own paths. The errno is the host's -- the same numbers
+// on macOS and Linux below 35 -- with the four a file call gives and the two
+// number differently put into Linux's: EAGAIN, ELOOP, ENAMETOOLONG, ENOTEMPTY.
+extern fn fd_open: str -> str -> int -> int;
+extern fn fd_read: int -> int -> int -> int;
+extern fn fd_write: int -> int -> int -> int;
+extern fn fd_close: int -> int;
+extern fn fd_seek: int -> int -> int -> int;
+extern fn fd_dup: int -> int;
+extern fn fd_isatty: int -> int;
+extern fn fd_pipe: unit -> int;
+extern fn fd_last_errno: unit -> int;
+extern fn dup2: int -> int -> int;
+extern fn fd_sync: int -> int;
+extern fn io_set_nonblocking: int -> int;
+extern fn mem_alloc: int -> int;
+extern fn mem_set_u8: int -> int -> int -> int;
+extern fn mem_get_u8: int -> int -> int;
+extern fn proc_sig_noop: int -> int;
+extern fn proc_sig_default: int -> int;
+let hbuf_cap = 65536;
+let hbuf = mem_alloc hbuf_cap;
+let lin_errno = fn e ->
+  if e == 35 then 11 else if e == 62 then 40 else if e == 63 then 36 else if e == 66 then 39 else e;
+let host_r = fn r -> if r < 0 then 0 - lin_errno (fd_last_errno ()) else r;
+// which numbers the host handed out: a write goes to the host only on one of
+// these. The guest's print never said which descriptor it meant (a0 held the
+// string), and this emulator printed every other write -- programs built
+// before v0.1.634 still do that, and still print.
+let hfd_cap = 4096;
+let hfd = new_vec hfd_cap 0;
+let hfd_is = fn fd -> fd > 2 && fd < hfd_cap && vec_get hfd fd == 1;
+let hfd_keep = fn r -> let _ = (if r > 2 && r < hfd_cap then vec_set hfd r 1 else ()) in r;
+let hfd_drop = fn fd -> fn r -> let _ = (if r == 0 && fd > 2 && fd < hfd_cap then vec_set hfd fd 0 else ()) in r;
+// Linux open flags back into a mode fopen takes; one that writes without
+// truncating opens read-write ("r+"), creating the file first for O_CREAT
+let host_open = fn path -> fn flags -> fn perm ->
+  let acc = bit_and flags 3 in
+  let cr = bit_and flags 64 != 0 in
+  let ex = bit_and flags 128 != 0 in
+  let tr = bit_and flags 512 != 0 in
+  let ap = bit_and flags 1024 != 0 in
+  if ex && cr && file_exists path then 0 - 17                          // -EEXIST
+  else
+    let mode = if acc == 0 then "r"
+               else if ap then (if acc == 2 then "a+" else "a")
+               else if tr && cr then (if acc == 2 then "w+" else "w")
+               else "r+" in
+    let _ = (if cr && mode == "r+" && (if file_exists path then false else true)
+             then (let _ = try_or (fn (u: unit) -> let _ = write_file path "" in true) false in ()) else ()) in
+    hfd_keep (host_r (fd_open path mode perm));
+let host_read = fn mem -> fn fd -> fn buf -> fn cnt ->
+  let n = if cnt < hbuf_cap then cnt else hbuf_cap in
+  let r = fd_read fd hbuf n in
+  if r < 0 then host_r r
+  else
+    let rec copy = fn i -> if i >= r then () else let _ = stb mem (buf + i) (mem_get_u8 hbuf i) in copy (i + 1) in
+    let _ = copy 0 in
+    r;
+let rec host_write = fn mem -> fn fd -> fn buf -> fn cnt -> fn done ->
+  if done >= cnt then done
+  else
+    let n = if cnt - done < hbuf_cap then cnt - done else hbuf_cap in
+    let rec copy = fn i -> if i >= n then () else let _ = mem_set_u8 hbuf i (ldb mem (buf + done + i)) in copy (i + 1) in
+    let _ = copy 0 in
+    let r = fd_write fd hbuf n in
+    if r < 0 then (if done > 0 then done else host_r r)
+    else if r < n then done + r
+    else host_write mem fd buf cnt (done + r);
 // newfstatat, from the host's stat through the C runtime's file_stat device
 // (Mere's extern ABI cannot name a struct stat): the 128 bytes of Linux's
 // riscv64 struct stat -- on both widths, a contract of this emulator's, since
@@ -237,6 +311,9 @@ let rec split_nul = fn s -> fn i -> fn start -> fn acc ->
   if i >= str_len s then acc
   else if ord (char_at s i) == 0 then split_nul s (i + 1) (i + 1) (Cons (substring s start i, acc))
   else split_nul s (i + 1) start acc;
+// v0.1.634 of the compiler: directory snapshots are numbered from here, out
+// of the way of the host's own descriptors, which every other open now is
+let dir_fd_base = 1000;
 let rec rev_onto = fn l -> fn acc -> match l with Nil -> acc | Cons (h, t) -> rev_onto t (Cons (h, acc));
 let sys_opendir = fn path ->
   if (if file_exists path then false else true) then 0 - 2               // -ENOENT
@@ -273,10 +350,11 @@ let sys_opendir = fn path ->
         let _ = vec_set fd_base slot base in
         let _ = vec_set fd_len slot (top - base) in
         let _ = vec_set fd_pos slot 0 in
-        slot;
+        dir_fd_base + slot;
 // getdents64: whole records from the cursor, as many as fit in cnt; 0 at the
 // end; -EINVAL when not even the next one fits
-let sys_getdents = fn mem -> fn fd -> fn buf -> fn cnt ->
+let sys_getdents = fn mem -> fn fd0 -> fn buf -> fn cnt ->
+  let fd = fd0 - dir_fd_base in
   if fd_bad fd then 0 - 9                                                // -EBADF
   else if vec_get fd_mode fd != 2 then 0 - 20                            // -ENOTDIR
   else
@@ -780,11 +858,8 @@ let step = fn mem -> fn x -> fn st ->
     else
       let a7 = vec_get x 17 in
       if a7 == 93 then halt st halt_exit
-      else if a7 == 64 && vec_get x 10 >= fd_first
-              && vec_get x 10 < fd_cap
-              && vec_get fd_used (vec_get x 10) == 1
-              && vec_get fd_mode (vec_get x 10) == 1 then     // write to a FILE
-        vec_set x 10 (sys_write_fd mem (vec_get x 10) (vec_get x 11) (vec_get x 12))
+      else if a7 == 64 && hfd_is (vec_get x 10) then                   // write: the host's fd
+        vec_set x 10 (host_write mem (vec_get x 10) (vec_get x 11) (vec_get x 12) 0)
       else if a7 == 64 then                                            // write
         let buf = vec_get x 11 in
         let len = vec_get x 12 in
@@ -807,11 +882,55 @@ let step = fn mem -> fn x -> fn st ->
         let _ = st64 mem (ts + 8) nsec in
         vec_set x 10 0
       else if a7 == 56 then                                            // openat
-        vec_set x 10 (sys_openat mem (vec_get x 11) (vec_get x 12))
+        let p = cstr_at mem (vec_get x 11) in
+        let fl = vec_get x 12 in
+        vec_set x 10 (if str_len p >= path_max then 0 - 36
+                      else if bit_and fl 65536 != 0 then sys_opendir p
+                      else host_open p fl (vec_get x 13))
       else if a7 == 63 then                                            // read
-        vec_set x 10 (sys_read mem (vec_get x 10) (vec_get x 11) (vec_get x 12))
+        let fd = vec_get x 10 in
+        vec_set x 10 (if fd == 0 then sys_read_stdin mem (vec_get x 11) (vec_get x 12)
+                      else if fd >= dir_fd_base then 0 - 21                // -EISDIR
+                      else host_read mem fd (vec_get x 11) (vec_get x 12))
       else if a7 == 57 then                                            // close
-        vec_set x 10 (sys_close (vec_get x 10))
+        let fd = vec_get x 10 in
+        vec_set x 10 (if fd >= dir_fd_base then sys_close (fd - dir_fd_base)
+                      else if fd <= 2 then 0
+                      else hfd_drop fd (host_r (fd_close fd)))
+      else if a7 == 134 then                                           // rt_sigaction
+        // the guest's handler word is SIG_DFL or SIG_IGN; ignoring becomes the
+        // host's catch-and-do-nothing (proc_sig_noop), so the emulator's own
+        // write to a closed pipe is EPIPE for the guest to see
+        let act = vec_get x 11 in
+        let h = if act == 0 then 2 else ldb mem act in
+        let r = if h == 0 then proc_sig_default (vec_get x 10)
+                else if h == 1 then proc_sig_noop (vec_get x 10) else 0 in
+        vec_set x 10 (if r < 0 then 0 - 22 else 0)
+      else if a7 == 62 then                                            // lseek
+        vec_set x 10 (host_r (fd_seek (vec_get x 10) (vec_get x 11) (vec_get x 12)))
+      else if a7 == 82 then vec_set x 10 (host_r (fd_sync (vec_get x 10)))   // fsync
+      else if a7 == 23 then vec_set x 10 (hfd_keep (host_r (fd_dup (vec_get x 10))))  // dup
+      else if a7 == 24 then vec_set x 10 (hfd_keep (host_r (dup2 (vec_get x 10) (vec_get x 11))))  // dup3
+      else if a7 == 59 then                                            // pipe2
+        let r = fd_pipe () in
+        if r < 0 then vec_set x 10 (host_r r)
+        else
+          let _ = hfd_keep (bit_shr r 32) in
+          let _ = hfd_keep (bit_and r 4294967295) in
+          let at = vec_get x 10 in
+          let rec put = fn i -> fn v -> if i >= 4 then () else let _ = stb mem (at + i) (bit_and v 255) in put (i + 1) (bit_shr v 8) in
+          let _ = put 0 (bit_shr r 32) in
+          let _ = (let rec put2 = fn i -> fn v -> if i >= 4 then () else let _ = stb mem (at + 4 + i) (bit_and v 255) in put2 (i + 1) (bit_shr v 8) in put2 0 (bit_and r 4294967295)) in
+          vec_set x 10 0
+      else if a7 == 29 then                                            // ioctl: TCGETS is isatty
+        vec_set x 10 (if vec_get x 11 != 21505 then 0 - 25
+                      else if fd_isatty (vec_get x 10) == 1 then 0 else 0 - 25)
+      else if a7 == 25 then                                            // fcntl
+        // F_GETFL answers read-write; F_SETFL with O_NONBLOCK is the host's
+        let cmd = vec_get x 11 in
+        vec_set x 10 (if cmd == 3 then 2
+                      else if cmd == 4 && bit_and (vec_get x 12) 2048 != 0 then host_r (io_set_nonblocking (vec_get x 10))
+                      else 0)
       else if a7 == 48 then                                            // faccessat
         // the mode is the host's access(2)'s to answer (R 4 / W 2 / X 1); a
         // path that is there and refused is -EACCES
