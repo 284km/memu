@@ -252,6 +252,12 @@ extern fn proc_getpriority: int -> int -> int;
 extern fn proc_setpriority: int -> int -> int -> int;
 extern fn shutdown: int -> int -> int;
 extern fn socket: int -> int -> int -> int;
+// v0.1.643 of the compiler: and the rest of mere-ruby's libc calls
+extern fn listen: int -> int -> int;
+extern fn getppid: unit -> int;
+extern fn getpgid: int -> int;
+extern fn getsid: int -> int;
+extern fn setsid: unit -> int;
 // v0.1.636 of the compiler: the rest of the file calls its guests make
 extern fn symlink: str -> str -> int;
 extern fn link: str -> str -> int;
@@ -1152,6 +1158,15 @@ let step = fn mem -> fn x -> fn st ->
         let t = bit_and (vec_get x 11) 15 in
         let r = socket hd t (vec_get x 12) in
         vec_set x 10 (if r < 0 then 0 - 97 else hfd_keep r)
+      else if a7 == 201 then                                           // listen
+        vec_set x 10 (if listen (vec_get x 10) (vec_get x 11) == 0 then 0 else 0 - 22)
+      else if a7 == 173 then vec_set x 10 (getppid ())                 // getppid
+      else if a7 == 155 then                                           // getpgid
+        (let r = getpgid (vec_get x 10) in vec_set x 10 (if r < 0 then 0 - 3 else r))
+      else if a7 == 156 then                                           // getsid
+        (let r = getsid (vec_get x 10) in vec_set x 10 (if r < 0 then 0 - 3 else r))
+      else if a7 == 157 then                                           // setsid
+        (let r = setsid () in vec_set x 10 (if r < 0 then 0 - 1 else r))
       else if a7 == 210 then                                           // shutdown
         vec_set x 10 (if shutdown (vec_get x 10) (vec_get x 11) == 0 then 0 else 0 - 107)
       else if a7 >= 1000 && a7 < 1100 then                             // the host device
