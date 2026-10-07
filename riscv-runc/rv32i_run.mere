@@ -221,6 +221,16 @@ extern fn mem_set_u8: int -> int -> int -> int;
 extern fn mem_get_u8: int -> int -> int;
 extern fn proc_sig_noop: int -> int;
 extern fn proc_sig_default: int -> int;
+// v0.1.636 of the compiler: the rest of the file calls its guests make
+extern fn symlink: str -> str -> int;
+extern fn link: str -> str -> int;
+extern fn rename: str -> str -> int;
+extern fn fchdir: int -> int;
+extern fn chroot: str -> int;
+extern fn file_umask: int -> int;
+extern fn file_flock: int -> int -> int;
+extern fn file_readlink: str -> int -> int -> int;
+extern fn file_utime: str -> int -> int -> int;
 let hbuf_cap = 65536;
 let hbuf = mem_alloc hbuf_cap;
 let lin_errno = fn e ->
@@ -959,6 +969,46 @@ let step = fn mem -> fn x -> fn st ->
         vec_set x 10 (if fd >= dir_fd_base then sys_close (fd - dir_fd_base)
                       else if fd <= 2 then 0
                       else hfd_drop fd (host_r (fd_close fd)))
+      // v0.1.636: the host's own answer; libc's leave no errno this side can
+      // read, so a failure names the likeliest one from what is on disk
+      else if a7 == 36 then                                            // symlinkat
+        let t = cstr_at mem (vec_get x 10) in
+        let l = cstr_at mem (vec_get x 12) in
+        vec_set x 10 (if symlink t l == 0 then 0 else if file_lstat l == 0 then 0 - 17 else 0 - 2)
+      else if a7 == 37 then                                            // linkat
+        let a = cstr_at mem (vec_get x 11) in
+        let b = cstr_at mem (vec_get x 13) in
+        vec_set x 10 (if link a b == 0 then 0 else if file_lstat b == 0 then 0 - 17 else 0 - 2)
+      else if a7 == 276 then                                           // renameat2
+        let a = cstr_at mem (vec_get x 11) in
+        let b = cstr_at mem (vec_get x 13) in
+        vec_set x 10 (if rename a b == 0 then 0 else if file_lstat a == 0 then 0 - 1 else 0 - 2)
+      else if a7 == 50 then                                            // fchdir
+        vec_set x 10 (if fchdir (vec_get x 10) == 0 then 0 else 0 - 9)
+      else if a7 == 51 then                                            // chroot
+        let p = cstr_at mem (vec_get x 10) in
+        vec_set x 10 (if chroot p == 0 then 0 else if file_exists p then 0 - 1 else 0 - 2)
+      else if a7 == 166 then vec_set x 10 (file_umask (vec_get x 10)) // umask
+      else if a7 == 32 then                                            // flock
+        let r = file_flock (vec_get x 10) (vec_get x 11) in
+        vec_set x 10 (if r == 0 then 0 else if r == 1 then 0 - 11 else 0 - 9)
+      else if a7 == 78 then                                            // readlinkat
+        let p = cstr_at mem (vec_get x 11) in
+        let cap0 = vec_get x 13 in
+        let cap = if cap0 < hbuf_cap then cap0 else hbuf_cap in
+        let r = file_readlink p hbuf cap in
+        if r < 0 then vec_set x 10 (if file_lstat p == 0 then 0 - 22 else 0 - 2)
+        else
+          let at = vec_get x 12 in
+          let rec copy = fn i -> if i >= r then () else let _ = stb mem (at + i) (mem_get_u8 hbuf i) in copy (i + 1) in
+          let _ = copy 0 in
+          vec_set x 10 r
+      else if a7 == 88 then                                            // utimensat
+        // two {sec, nsec} pairs of this machine's words; whole seconds
+        let p = cstr_at mem (vec_get x 11) in
+        let tb = vec_get x 12 in
+        vec_set x 10 (if file_utime p (ld32 mem tb) (ld32 mem (tb + 2 * 4)) == 0 then 0
+                      else if file_exists p then 0 - 1 else 0 - 2)
       else if a7 == 134 then                                           // rt_sigaction
         // the guest's handler word is SIG_DFL or SIG_IGN; ignoring becomes the
         // host's catch-and-do-nothing (proc_sig_noop), so the emulator's own
