@@ -221,6 +221,37 @@ extern fn mem_set_u8: int -> int -> int -> int;
 extern fn mem_get_u8: int -> int -> int;
 extern fn proc_sig_noop: int -> int;
 extern fn proc_sig_default: int -> int;
+// v0.1.641 of the compiler: the host device -- the C runtime's sockets,
+// readiness sets and resource limits, called for the guest (calls 1000 up)
+extern fn tcp_listen_at: str -> int -> int -> int;
+extern fn tcp_listen: int -> int;
+extern fn tcp_accept: int -> int;
+extern fn tcp_connect: str -> int -> int;
+extern fn tcp_close: int -> unit;
+extern fn tcp_set_timeout: int -> int -> int;
+extern fn sock_bind: int -> str -> int -> int;
+extern fn sock_local_addr: int -> str;
+extern fn sock_peer_addr: int -> str;
+extern fn sock_pair: int -> int;
+extern fn udp_open: str -> int -> int;
+extern fn udp_send: int -> int -> int -> int;
+extern fn udp_recv: int -> int -> int -> int;
+extern fn io_poll_new: int -> int;
+extern fn io_poll_add: int -> int -> int -> int;
+extern fn io_poll_del: int -> int -> int;
+extern fn io_poll_wait: int -> int -> int;
+extern fn io_poll_get: int -> int -> int;
+extern fn proc_last_errno: unit -> int;
+extern fn proc_getrlimit: str -> int;
+extern fn proc_setrlimit: str -> int -> int -> int;
+extern fn proc_rlimit_field: int -> int;
+extern fn proc_rlimit_resource: str -> int;
+extern fn proc_rlimit_names: unit -> str;
+extern fn proc_rlim_const: str -> str;
+extern fn proc_getpriority: int -> int -> int;
+extern fn proc_setpriority: int -> int -> int -> int;
+extern fn shutdown: int -> int -> int;
+extern fn socket: int -> int -> int -> int;
 // v0.1.636 of the compiler: the rest of the file calls its guests make
 extern fn symlink: str -> str -> int;
 extern fn link: str -> str -> int;
@@ -233,8 +264,55 @@ extern fn file_readlink: str -> int -> int -> int;
 extern fn file_utime: str -> int -> int -> int;
 let hbuf_cap = 65536;
 let hbuf = mem_alloc hbuf_cap;
+// v0.1.641 of the compiler: the guest's errno is Linux's. On a Linux host it
+// already is; on a BSD-numbered one (macOS) every number from 35 up moves --
+// EAGAIN, the socket family's, ELOOP, ENAMETOOLONG, ENOTEMPTY and the rest.
+// The host is told apart by /proc/self, which Linux has and macOS does not:
+// translating on Linux turned its EDEADLK (35) into EAGAIN.
+let host_is_linux = file_exists "/proc/self";
 let lin_errno = fn e ->
-  if e == 35 then 11 else if e == 62 then 40 else if e == 63 then 36 else if e == 66 then 39 else e;
+  if host_is_linux || e < 35 then e
+  else if e == 35 then 11
+  else if e == 36 then 115
+  else if e == 37 then 114
+  else if e == 38 then 88
+  else if e == 39 then 89
+  else if e == 40 then 90
+  else if e == 41 then 91
+  else if e == 42 then 92
+  else if e == 43 then 93
+  else if e == 44 then 94
+  else if e == 45 then 95
+  else if e == 46 then 96
+  else if e == 47 then 97
+  else if e == 48 then 98
+  else if e == 49 then 99
+  else if e == 50 then 100
+  else if e == 51 then 101
+  else if e == 52 then 102
+  else if e == 53 then 103
+  else if e == 54 then 104
+  else if e == 55 then 105
+  else if e == 56 then 106
+  else if e == 57 then 107
+  else if e == 58 then 108
+  else if e == 59 then 109
+  else if e == 60 then 110
+  else if e == 61 then 111
+  else if e == 62 then 40
+  else if e == 63 then 36
+  else if e == 64 then 112
+  else if e == 65 then 113
+  else if e == 66 then 39
+  else if e == 69 then 122
+  else if e == 70 then 116
+  else if e == 77 then 37
+  else if e == 78 then 38
+  else if e == 84 then 75
+  else if e == 89 then 125
+  else if e == 92 then 84
+  else if e == 102 then 95
+  else e;
 let host_r = fn r -> if r < 0 then 0 - lin_errno (fd_last_errno ()) else r;
 // which numbers the host handed out: a write goes to the host only on one of
 // these. The guest's print never said which descriptor it meant (a0 held the
@@ -282,6 +360,56 @@ let rec host_write = fn mem -> fn fd -> fn buf -> fn cnt -> fn done ->
     if r < 0 then (if done > 0 then done else host_r r)
     else if r < n then done + r
     else host_write mem fd buf cnt (done + r);
+// v0.1.641 of the compiler: the host device. A str goes in as the guest's
+// NUL-terminated bytes and comes back written into the guest's buffer (its
+// length answered); bytes for a datagram cross the C runtime's arena. A
+// descriptor the host hands back is one of the host's (hfd).
+let host_put_str = fn mem -> fn at -> fn cap -> fn s ->
+  let n = if str_len s < cap then str_len s else cap in
+  let rec copy = fn i -> if i >= n then () else let _ = stb mem (at + i) (ord (char_at s i)) in copy (i + 1) in
+  let _ = copy 0 in
+  str_len s;
+let host_call = fn mem -> fn k -> fn a -> fn b -> fn c ->
+  if k == 1000 then hfd_keep (tcp_listen_at (cstr_at mem a) b c)
+  else if k == 1001 then hfd_keep (tcp_listen a)
+  else if k == 1002 then hfd_keep (tcp_accept a)
+  else if k == 1003 then hfd_keep (tcp_connect (cstr_at mem a) b)
+  else if k == 1004 then (let _ = tcp_close a in hfd_drop a 0)
+  else if k == 1005 then tcp_set_timeout a b
+  else if k == 1006 then sock_bind a (cstr_at mem b) c
+  else if k == 1007 then host_put_str mem b c (sock_local_addr a)
+  else if k == 1008 then host_put_str mem b c (sock_peer_addr a)
+  else if k == 1009 then
+    (let r = sock_pair a in
+     let _ = (if r >= 0 then (let _ = hfd_keep (bit_shr r 20) in hfd_keep (bit_and r 1048575)) else 0) in
+     r)
+  else if k == 1010 then hfd_keep (udp_open (cstr_at mem a) b)
+  else if k == 1011 then
+    (let n = if c < hbuf_cap then c else hbuf_cap in
+     let rec copy = fn i -> if i >= n then () else let _ = mem_set_u8 hbuf i (ldb mem (b + i)) in copy (i + 1) in
+     let _ = copy 0 in
+     udp_send a hbuf n)
+  else if k == 1012 then
+    (let n = udp_recv a hbuf (if c < hbuf_cap then c else hbuf_cap) in
+     let rec copy = fn i -> if i >= n then () else let _ = stb mem (b + i) (mem_get_u8 hbuf i) in copy (i + 1) in
+     let _ = copy 0 in
+     n)
+  else if k == 1013 then io_poll_new a
+  else if k == 1014 then io_poll_add a b c
+  else if k == 1015 then io_poll_del a b
+  else if k == 1016 then io_poll_wait a b
+  else if k == 1017 then io_poll_get a b
+  else if k == 1020 then proc_getrlimit (cstr_at mem a)
+  else if k == 1021 then proc_setrlimit (cstr_at mem a) b c
+  else if k == 1022 then proc_rlimit_field a
+  else if k == 1023 then proc_rlimit_resource (cstr_at mem a)
+  else if k == 1024 then host_put_str mem b c (proc_rlimit_names ())
+  else if k == 1025 then host_put_str mem b c (proc_rlim_const (cstr_at mem a))
+  else if k == 1026 then proc_getpriority a b
+  else if k == 1027 then proc_setpriority a b c
+  else if k == 1098 then lin_errno (fd_last_errno ())
+  else if k == 1099 then lin_errno (proc_last_errno ())
+  else 0 - 38;                                                          // -ENOSYS
 // newfstatat, from the host's stat through the C runtime's file_stat device
 // (Mere's extern ABI cannot name a struct stat): the 128 bytes of Linux's
 // riscv64 struct stat -- on both widths, a contract of this emulator's, since
@@ -1016,6 +1144,18 @@ let step = fn mem -> fn x -> fn st ->
         let tb = vec_get x 12 in
         vec_set x 10 (if file_utime p (ld32 mem tb) (ld32 mem (tb + 2 * 4)) == 0 then 0
                       else if file_exists p then 0 - 1 else 0 - 2)
+      else if a7 == 198 then                                           // socket
+        // Linux's family numbers to the host's (AF_INET6 is 10 there, 30 on
+        // macOS); the type's SOCK_NONBLOCK / SOCK_CLOEXEC bits are Linux's own
+        let d = vec_get x 10 in
+        let hd = if host_is_linux then d else if d == 10 then 30 else d in
+        let t = bit_and (vec_get x 11) 15 in
+        let r = socket hd t (vec_get x 12) in
+        vec_set x 10 (if r < 0 then 0 - 97 else hfd_keep r)
+      else if a7 == 210 then                                           // shutdown
+        vec_set x 10 (if shutdown (vec_get x 10) (vec_get x 11) == 0 then 0 else 0 - 107)
+      else if a7 >= 1000 && a7 < 1100 then                             // the host device
+        vec_set x 10 (host_call mem a7 (vec_get x 10) (vec_get x 11) (vec_get x 12))
       else if a7 == 134 then                                           // rt_sigaction
         // the guest's handler word is SIG_DFL or SIG_IGN; ignoring becomes the
         // host's catch-and-do-nothing (proc_sig_noop), so the emulator's own
