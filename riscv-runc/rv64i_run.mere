@@ -49,7 +49,21 @@ let halt_crossed = 5;
 let halt = fn st -> fn (why: int) -> let _ = vec_set st 2 why in vec_set st 1 1;
 
 // --- where RAM is ---------------------------------------------------------
-let virt = match args () with
+// v0.1.646 of the compiler: memu started as a program's interpreter. A
+// program that starts itself again (mere-ruby's RbConfig.ruby is this
+// binary, found through lsof or /proc/<pid>/exe) runs `rvrun64 script.rb`:
+// the first argument is not a RAM size. Then the RAM and the program are the
+// ones the first memu left in the environment (MEMU_RAM, MEMU_PROG), every
+// argument is the guest's, and none of them arms an instrument -- a script
+// argument named `trace` or `prof` is the program's.
+let rec all_digits = fn s -> fn i ->
+  if i >= str_len s then i > 0
+  else (let c = ord (char_at s i) in if c >= 48 && c <= 57 then all_digits s (i + 1) else false);
+let as_cmd = match args () with
+  | Cons (a, _) -> not (all_digits a 0)
+  | Nil -> (match env_var "MEMU_PROG" with Some _ -> true | None -> false);
+let opts = if as_cmd then Nil else args ();
+let virt = match opts with
   | Cons (_, Cons (b, _)) -> if str_eq b "virt" then 1 else 0
   | _ -> 0;
 let dram_base = if virt == 1 then 2147483648 else 0;
@@ -247,6 +261,7 @@ extern fn proc_rlimit_names: unit -> str;
 extern fn proc_rlim_const: str -> str;
 extern fn proc_getpriority: int -> int -> int;
 extern fn proc_setpriority: int -> int -> int -> int;
+extern fn setenv: str -> str -> int -> int;
 extern fn shutdown: int -> int -> int;
 extern fn socket: int -> int -> int -> int;
 // v0.1.643 of the compiler: and the rest of mere-ruby's libc calls
@@ -359,6 +374,18 @@ let hfd = new_vec hfd_cap 0;
 let hfd_is = fn fd -> fd > 2 && fd < hfd_cap && vec_get hfd fd == 1;
 let hfd_keep = fn r -> let _ = (if r > 2 && r < hfd_cap then vec_set hfd r 1 else ()) in r;
 let hfd_drop = fn fd -> fn r -> let _ = (if r == 0 && fd > 2 && fd < hfd_cap then vec_set hfd fd 0 else ()) in r;
+// v0.1.646 of the compiler: descriptors this process was started with are the
+// host's too. A child program writes to the pipe its parent handed it
+// (mere-ruby's `spawn(..., w => w)` and `IO.new(fd)`), and a descriptor memu
+// did not mark went to stdout instead. Before memu opens anything of its
+// own, every open one from 3 up is marked: dup answers whether it is open.
+let rec hfd_inherit = fn (fd: int) ->
+  if fd >= 256 then ()
+  else
+    (let d = fd_dup fd in
+     let _ = (if d >= 0 then (let _ = fd_close d in hfd_keep fd) else 0) in
+     hfd_inherit (fd + 1));
+let _ = hfd_inherit 3;
 // Linux open flags back into a mode fopen takes; one that writes without
 // truncating opens read-write ("r+"), creating the file first for O_CREAT
 let host_open = fn path -> fn flags -> fn perm ->
@@ -1245,13 +1272,15 @@ let step = fn mem -> fn x -> fn st ->
   else take_trap st 2 inst pc;
 
 // --- run a compiled program -------------------------------------------------
-let ram_mb = match args () with
+let ram_mb = if as_cmd then (match env_var "MEMU_RAM" with Some r -> int_of_str r | None -> 256)
+  else match args () with
   | Cons (a, _) -> int_of_str a
   | Nil -> 8;
 let mem = new_vec (ram_mb * 1048576) 0;
 let x = new_vec 32 0;
 let st = new_vec 3 0;
-let prog = read_file_bytes "prog.bin";
+let prog_path = if as_cmd then (match env_var "MEMU_PROG" with Some p -> p | None -> "prog.bin") else "prog.bin";
+let prog = read_file_bytes prog_path;
 let pn = vec_len prog;
 let rec load = fn i -> if i >= pn then () else let _ = stb mem (dram_base + i) (vec_get prog i) in load (i + 1);
 let _ = load 0;
@@ -1265,7 +1294,7 @@ let rec drop_to_sep = fn l ->
   match l with
   | Nil -> Nil
   | Cons (a, rest) -> if str_eq a "--" then rest else drop_to_sep rest;
-let guest_args = drop_to_sep (args ());
+let guest_args = if as_cmd then args () else drop_to_sep (args ());
 let rec count_of = fn l -> match l with Nil -> 0 | Cons (_, r) -> 1 + count_of r;
 let gn = count_of guest_args;
 let rec put_str = fn at -> fn s ->
@@ -1293,8 +1322,19 @@ let _ =
 // K=V and a NUL each. Whole variables that do not fit are left out.
 let envp_base = argv_base + 0x3000;
 let envp_room = 0x3000 - 16;
+// v0.1.646: without the two variables a memu leaves for the processes the
+// guest starts (MEMU_RAM, MEMU_PROG): they are the emulator's, and a child
+// program listing its ENV would see them where ruby's does not
+let rec env_drop_memu = fn (e: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len e then acc
+  else
+    (let rec nul = fn (k: int) -> if k >= str_len e || ord (char_at e k) == 0 then k else nul (k + 1) in
+     let j = nul i in
+     let frame = substring e i (if j < str_len e then j + 1 else j) in
+     let keep = not (str_starts_with frame "MEMU_RAM=" || str_starts_with frame "MEMU_PROG=") in
+     env_drop_memu e (j + 1) (if keep then acc ++ frame else acc));
 let _ =
-  let e = env_pairs () in
+  let e = env_drop_memu (env_pairs ()) 0 "" in
   let rec fit = fn i -> fn last ->
     if i >= str_len e || i >= envp_room then last
     else if ord (char_at e i) == 0 then fit (i + 1) (i + 1)
@@ -1305,6 +1345,11 @@ let _ =
   let rec put = fn i -> if i >= n then () else let _ = stb mem (envp_base + 16 + i) (ord (char_at e i)) in put (i + 1) in
   put 0;
 
+// v0.1.646: what a memu started as the interpreter needs (see as_cmd), for
+// every process the guest starts -- after the guest's environment block is
+// laid, so the program's own ENV does not gain them
+let _ = setenv "MEMU_RAM" (str_of_int ram_mb) 1;
+let _ = setenv "MEMU_PROG" (if str_starts_with prog_path "/" then prog_path else proc_cwd () ++ "/" ++ prog_path) 1;
 let _ = vec_set x 2 (dram_base + 0x70000);
 let _ = vec_set st 0 dram_base;
 
@@ -1316,7 +1361,7 @@ let timer_pending = fn () ->
   else if bit_and (bit_shr (vec_get csr csr_mstatus) 3) 1 == 0 then 0
   else if bit_and (bit_shr (vec_get csr csr_mie) 7) 1 == 0 then 0
   else 1;
-let trace = match args () with
+let trace = match opts with
   | Cons (_, Cons (b, _)) -> if str_eq b "trace" then 1 else 0
   | _ -> 0;
 let _ = vec_set swon 0 trace;
@@ -1327,12 +1372,12 @@ let rec find_watch = fn l ->
     if str_eq a "--" then 0
     else if str_eq a "watch" then (match rest with Cons (n, _) -> int_of_str n | Nil -> 0)
     else find_watch rest;
-let _ = vec_set watch_addr 0 (find_watch (args ()));
+let _ = vec_set watch_addr 0 (find_watch opts);
 let rec find_abi = fn l ->
   match l with
   | Nil -> 0
   | Cons (s, rest) -> if str_eq s "abi" then 1 else find_abi rest;
-let _ = vec_set abi_on 0 (find_abi (args ()));
+let _ = vec_set abi_on 0 (find_abi opts);
 // `prof`: a sampling profile of the guest. Every 997th instruction (a prime, so
 // a loop's period does not alias with it) the PC's word index is counted, and at
 // exit each nonzero count is written to stderr as `rvprof <pc> <count>`.
@@ -1343,7 +1388,7 @@ let rec find_prof = fn l ->
   match l with
   | Nil -> 0
   | Cons (s, rest) -> if str_eq s "--" then 0 else if str_eq s "prof" then 1 else find_prof rest;
-let prof_on = find_prof (args ());
+let prof_on = find_prof opts;
 let prof_slots = 4194304;
 let prof_hist = new_vec (if prof_on == 1 then prof_slots else 1) 0;
 // `aprof`: where the guest allocates. After each instruction that raised gp
@@ -1356,7 +1401,7 @@ let rec find_aprof = fn l ->
   match l with
   | Nil -> 0
   | Cons (s, rest) -> if str_eq s "--" then 0 else if str_eq s "aprof" then 1 else find_aprof rest;
-let aprof_on = find_aprof (args ());
+let aprof_on = find_aprof opts;
 let aprof_hist = new_vec (if aprof_on == 1 then prof_slots else 1) 0;
 let prof_tick = new_vec 1 0;
 let icount = new_vec 1 0;
