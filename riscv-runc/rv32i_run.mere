@@ -265,6 +265,13 @@ extern fn proc_rlim_const: str -> str;
 extern fn proc_getpriority: int -> int -> int;
 extern fn proc_setpriority: int -> int -> int -> int;
 extern fn setenv: str -> str -> int -> int;
+// v0.1.647 of the compiler: the rest of the C runtime's signal calls, and the
+// errno of the last write print_no_nl could not make
+extern fn proc_sig_raise: int -> int;
+extern fn proc_sig_catch: int -> int -> int;
+extern fn proc_sig_take: unit -> int;
+extern fn proc_sig_ignore: int -> int;
+extern fn proc_out_errno: unit -> int;
 extern fn shutdown: int -> int -> int;
 extern fn socket: int -> int -> int -> int;
 // v0.1.643 of the compiler: and the rest of mere-ruby's libc calls
@@ -309,6 +316,9 @@ let lin_sig = fn s ->
   else if s == 30 then 10
   else if s == 31 then 12
   else s;
+// v0.1.647: why the guest's last write to stdout failed (Linux's number), for
+// proc_out_errno (call 1035); read and cleared
+let guest_out_errno = new_vec 1 0;
 let host_sig = fn s ->
   if host_is_linux then s
   else if s == 7 then 10
@@ -476,6 +486,14 @@ let host_call = fn mem -> fn k -> fn a -> fn b -> fn c ->
   else if k == 1030 then
     (let r = run (cstr_at mem a) in
      if r > 128 && r <= 192 then 128 + lin_sig (r - 128) else r)
+  // v0.1.647: the signal calls -- the guest's number to the host's, and a
+  // signal taken back to Linux's. raise of a signal whose disposition is the
+  // default ends this process with it, as it ends a native program.
+  else if k == 1031 then proc_sig_raise (host_sig a)
+  else if k == 1032 then proc_sig_catch (host_sig a) b
+  else if k == 1033 then (let sg = proc_sig_take () in if sg > 0 then lin_sig sg else sg)
+  else if k == 1034 then proc_sig_ignore (host_sig a)
+  else if k == 1035 then (let e = vec_get guest_out_errno 0 in let _ = vec_set guest_out_errno 0 0 in e)
   else if k == 1098 then lin_errno (fd_last_errno ())
   else if k == 1099 then lin_errno (proc_last_errno ())
   else 0 - 38;                                                          // -ENOSYS
@@ -1135,7 +1153,11 @@ let step = fn mem -> fn x -> fn st ->
             let _ = strbuf_push sb (chr (ldb mem (mask32 (buf + i)))) in emit (i + 1) in
         let _ = emit 0 in
         let _ = print_no_nl (strbuf_to_str sb) in
-        vec_set x 10 len                                             // return bytes written in a0
+        // v0.1.647: a write the host refused (EPIPE on a closed pipe) is the
+        // guest's error, not a write that happened
+        let e = proc_out_errno () in
+        if e != 0 then (let _ = vec_set guest_out_errno 0 (lin_errno e) in vec_set x 10 (0 - lin_errno e))
+        else vec_set x 10 len                                             // return bytes written in a0
       // clock_gettime64(clockid, *timespec64) -- Linux's rv32 number, like the
       // write and exit above. Every clockid gets the host's wall clock: this
       // Mere has no separate monotonic source, and a wall clock that a guest
