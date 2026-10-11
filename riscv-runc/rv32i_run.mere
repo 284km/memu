@@ -276,6 +276,37 @@ let hbuf = mem_alloc hbuf_cap;
 // The host is told apart by /proc/self, which Linux has and macOS does not:
 // translating on Linux turned its EDEADLK (35) into EAGAIN.
 let host_is_linux = file_exists "/proc/self";
+// v0.1.645 of the compiler: signal numbers. The guest's are Linux's; a
+// BSD-numbered host (macOS) gives SIGBUS, SIGUSR1/2, SIGCHLD, SIGSTOP and
+// the job-control family other numbers. Translated both ways, and not at all
+// on a Linux host. (macOS's SIGEMT and SIGINFO have no Linux number and pass
+// through as they are.)
+let lin_sig = fn s ->
+  if host_is_linux then s
+  else if s == 10 then 7
+  else if s == 12 then 31
+  else if s == 16 then 23
+  else if s == 17 then 19
+  else if s == 18 then 20
+  else if s == 19 then 18
+  else if s == 20 then 17
+  else if s == 23 then 29
+  else if s == 30 then 10
+  else if s == 31 then 12
+  else s;
+let host_sig = fn s ->
+  if host_is_linux then s
+  else if s == 7 then 10
+  else if s == 31 then 12
+  else if s == 23 then 16
+  else if s == 19 then 17
+  else if s == 20 then 18
+  else if s == 18 then 19
+  else if s == 17 then 20
+  else if s == 29 then 23
+  else if s == 10 then 30
+  else if s == 12 then 31
+  else s;
 let lin_errno = fn e ->
   if host_is_linux || e < 35 then e
   else if e == 35 then 11
@@ -413,6 +444,11 @@ let host_call = fn mem -> fn k -> fn a -> fn b -> fn c ->
   else if k == 1025 then host_put_str mem b c (proc_rlim_const (cstr_at mem a))
   else if k == 1026 then proc_getpriority a b
   else if k == 1027 then proc_setpriority a b c
+  // v0.1.645: run -- `/bin/sh -c`, the host's, as the C runtime's run. A
+  // child killed by a signal answers 128 + its number, put in Linux's
+  else if k == 1030 then
+    (let r = run (cstr_at mem a) in
+     if r > 128 && r <= 192 then 128 + lin_sig (r - 128) else r)
   else if k == 1098 then lin_errno (fd_last_errno ())
   else if k == 1099 then lin_errno (proc_last_errno ())
   else 0 - 38;                                                          // -ENOSYS
@@ -1177,8 +1213,8 @@ let step = fn mem -> fn x -> fn st ->
         // write to a closed pipe is EPIPE for the guest to see
         let act = vec_get x 11 in
         let h = if act == 0 then 2 else ldb mem act in
-        let r = if h == 0 then proc_sig_default (vec_get x 10)
-                else if h == 1 then proc_sig_noop (vec_get x 10) else 0 in
+        let r = if h == 0 then proc_sig_default (host_sig (vec_get x 10))
+                else if h == 1 then proc_sig_noop (host_sig (vec_get x 10)) else 0 in
         vec_set x 10 (if r < 0 then 0 - 22 else 0)
       else if a7 == 62 then                                            // lseek
         // a 32-bit offset, signed: this machine's registers hold it unsigned
