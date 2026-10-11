@@ -91,10 +91,12 @@ let swi = new_vec 1 0;
 let sw_hi = 33554432;          // heap range: below this RAM's midpoint
 let stack_lo = 58720256;       // values in the top ~8MB of a 64MB machine
 
-let ldb = fn mem -> fn a -> vec_get mem (a - dram_base);
-let stb = fn mem -> fn a -> fn v -> vec_set mem (a - dram_base) (bit_and v 255);
+// v0.1.650 of the compiler: RAM is a byte buffer, one host byte for each of
+// the guest's -- it was a Vec of words, eight host bytes for each.
+let ldb = fn mem -> fn a -> bytebuf_get mem (a - dram_base);
+let stb = fn mem -> fn a -> fn v -> bytebuf_set mem (a - dram_base) v;
 let in_ram = fn mem -> fn a ->
-  a >= dram_base && a - dram_base + 3 < vec_len mem;
+  a >= dram_base && a - dram_base + 3 < bytebuf_len mem;
 let ld32 = fn mem -> fn a ->
   ldb mem a + ldb mem (a + 1) * 256 + ldb mem (a + 2) * 65536 + ldb mem (a + 3) * 16777216;
 let st32 = fn mem -> fn a -> fn v ->
@@ -1408,7 +1410,7 @@ let ram_mb = if as_cmd then (match env_var "MEMU_RAM" with Some r -> int_of_str 
   else match args () with
   | Cons (a, _) -> int_of_str a
   | Nil -> 8;
-let mem = new_vec (ram_mb * 1048576) 0;
+let mem = bytebuf_new (ram_mb * 1048576);
 let x = new_vec 32 0;
 let st = new_vec 3 0;
 let prog_path = if as_cmd then (match env_var "MEMU_PROG" with Some p -> p | None -> "prog.bin") else "prog.bin";

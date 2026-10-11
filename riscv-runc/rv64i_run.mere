@@ -73,10 +73,14 @@ let swon = new_vec 1 0;
 let watch_addr = new_vec 1 0;
 
 // --- little-endian byte memory --------------------------------------------
-let ldb = fn mem -> fn a -> vec_get mem (a - dram_base);
-let stb = fn mem -> fn a -> fn v -> vec_set mem (a - dram_base) (bit_and v 255);
+// v0.1.650 of the compiler: RAM is a byte buffer, one host byte for each of
+// the guest's -- it was a Vec of words, eight host bytes for each (a 256 MB
+// guest took 2.2 GB of the host, and a larger one would not fit). The same
+// speed: mere-ruby's start, 3.47 s before and 3.44 s after.
+let ldb = fn mem -> fn a -> bytebuf_get mem (a - dram_base);
+let stb = fn mem -> fn a -> fn v -> bytebuf_set mem (a - dram_base) v;
 let in_ram = fn mem -> fn a ->
-  a >= dram_base && a - dram_base + 7 < vec_len mem;
+  a >= dram_base && a - dram_base + 7 < bytebuf_len mem;
 // instructions stay 32 bits wide on RV64; only the data paths widen
 let ld32 = fn mem -> fn a ->
   ldb mem a + ldb mem (a + 1) * 256 + ldb mem (a + 2) * 65536 + ldb mem (a + 3) * 16777216;
@@ -1298,7 +1302,7 @@ let ram_mb = if as_cmd then (match env_var "MEMU_RAM" with Some r -> int_of_str 
   else match args () with
   | Cons (a, _) -> int_of_str a
   | Nil -> 8;
-let mem = new_vec (ram_mb * 1048576) 0;
+let mem = bytebuf_new (ram_mb * 1048576);
 let x = new_vec 32 0;
 let st = new_vec 3 0;
 let prog_path = if as_cmd then (match env_var "MEMU_PROG" with Some p -> p | None -> "prog.bin") else "prog.bin";
