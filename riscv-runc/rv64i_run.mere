@@ -455,6 +455,23 @@ extern fn proc_spawn: str -> str -> str -> str -> int -> str -> int;
 extern fn proc_waitpid: int -> int -> int;
 extern fn proc_wait_status: unit -> int;
 let spawn_args = new_vec 3 "";
+// The child gets the environment the guest passes, which never holds
+// MEMU_RAM / MEMU_PROG (they are this emulator's and hidden from the guest's
+// ENV, env_drop_memu). A child that is memu itself -- RbConfig.ruby is this
+// program -- needs them to start as the interpreter of its program rather
+// than as a fresh memu on a relative prog.bin, so they are added from the
+// host's environment when the guest's does not name them -- for every child,
+// since this emulator cannot tell which one is itself. A child of a native
+// program would not see them; a child here did, as it did through `run`
+// (call 1030), which went through the shell and inherited them.
+let env_has = fn (e: str) -> fn (k: str) -> str_starts_with e k || str_contains e (chr 0 ++ k);
+let env_add_memu = fn (e: str) ->
+  let add = fn (acc: str) -> fn (k: str) ->
+    if env_has acc (k ++ "=") then acc
+    else match env_var k with
+      | Some v -> if acc == "" then k ++ "=" ++ v else acc ++ chr 0 ++ k ++ "=" ++ v
+      | None -> acc in
+  add (add e "MEMU_RAM") "MEMU_PROG";
 let mstr_at = fn mem -> fn p ->
   let n = ld64 mem p in
   let sb = strbuf_new () in
@@ -517,7 +534,7 @@ let host_call = fn mem -> fn k -> fn a -> fn b -> fn c ->
      let _ = vec_set spawn_args 1 (mstr_at mem b) in
      let _ = vec_set spawn_args 2 (mstr_at mem c) in 0)
   else if k == 1037 then
-    proc_spawn (vec_get spawn_args 0) (vec_get spawn_args 1) (vec_get spawn_args 2)
+    proc_spawn (vec_get spawn_args 0) (vec_get spawn_args 1) (env_add_memu (vec_get spawn_args 2))
                (mstr_at mem a) b (mstr_at mem c)
   else if k == 1038 then proc_waitpid a b
   else if k == 1039 then proc_wait_status ()
