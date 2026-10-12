@@ -445,6 +445,23 @@ let host_put_str = fn mem -> fn at -> fn cap -> fn s ->
   let rec copy = fn i -> if i >= n then () else let _ = stb mem (at + i) (ord (char_at s i)) in copy (i + 1) in
   let _ = copy 0 in
   str_len s;
+// v0.1.660 of the compiler: proc_spawn in two calls -- six arguments do not
+// fit three registers. 1036 hands over the path, argv and envp, 1037 the file
+// actions, the process group and the directory, and spawns through the C
+// runtime's proc_spawn (posix_spawn; Linux's O_* in, Linux's errno out, so
+// nothing is translated here). A str crosses as its block: the length word,
+// then the bytes, NULs and all -- argv and envp are NUL-separated. 1038 is
+// waitpid, 1039 the status it took (Linux's form already).
+extern fn proc_spawn: str -> str -> str -> str -> int -> str -> int;
+extern fn proc_waitpid: int -> int -> int;
+extern fn proc_wait_status: unit -> int;
+let spawn_args = new_vec 3 "";
+let mstr_at = fn mem -> fn p ->
+  let n = ld32 mem p in
+  let sb = strbuf_new () in
+  let rec go = fn i -> if i >= n then () else let _ = strbuf_push sb (chr (ldb mem (p + 4 + i))) in go (i + 1) in
+  let _ = go 0 in
+  strbuf_to_str sb;
 let host_call = fn mem -> fn k -> fn a -> fn b -> fn c ->
   if k == 1000 then hfd_keep (tcp_listen_at (cstr_at mem a) b c)
   else if k == 1001 then hfd_keep (tcp_listen a)
@@ -496,6 +513,16 @@ let host_call = fn mem -> fn k -> fn a -> fn b -> fn c ->
   else if k == 1033 then (let sg = proc_sig_take () in if sg > 0 then lin_sig sg else sg)
   else if k == 1034 then proc_sig_ignore (host_sig a)
   else if k == 1035 then (let e = vec_get guest_out_errno 0 in let _ = vec_set guest_out_errno 0 0 in e)
+  else if k == 1036 then
+    (let _ = vec_set spawn_args 0 (mstr_at mem a) in
+     let _ = vec_set spawn_args 1 (mstr_at mem b) in
+     let _ = vec_set spawn_args 2 (mstr_at mem c) in 0)
+  else if k == 1037 then
+    proc_spawn (vec_get spawn_args 0) (vec_get spawn_args 1) (vec_get spawn_args 2)
+               (mstr_at mem a) (signed32 b) (mstr_at mem c)
+  // a register is 32 bits here: -1 (no group change, any child) is 2^32 - 1
+  else if k == 1038 then proc_waitpid (signed32 a) (signed32 b)
+  else if k == 1039 then proc_wait_status ()
   else if k == 1098 then lin_errno (fd_last_errno ())
   else if k == 1099 then lin_errno (proc_last_errno ())
   else 0 - 38;                                                          // -ENOSYS
