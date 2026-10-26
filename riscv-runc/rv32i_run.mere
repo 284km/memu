@@ -257,6 +257,9 @@ extern fn sys_openlog: str -> int -> int -> int;
 extern fn sys_syslog: int -> str -> int;
 extern fn sys_closelog: unit -> int;
 extern fn sys_setlogmask: int -> int;
+// Mere v0.1.678: socket options, their bytes as hex
+extern fn sock_getopt: int -> int -> int -> str;
+extern fn sock_setopt: int -> int -> int -> str -> int;
 extern fn udp_open: str -> int -> int;
 extern fn udp_send: int -> int -> int -> int;
 extern fn udp_recv: int -> int -> int -> int;
@@ -448,6 +451,32 @@ let rec host_write = fn mem -> fn fd -> fn buf -> fn cnt -> fn done ->
 // NUL-terminated bytes and comes back written into the guest's buffer (its
 // length answered); bytes for a datagram cross the C runtime's arena. A
 // descriptor the host hands back is one of the host's (hfd).
+// Mere v0.1.678: socket options. A guest speaks Linux's SOL_* / SO_* /
+// IP_* numbers; on a macOS host they are asked for by the host's. The level
+// and the name are translated together (a name means something only under its
+// level); one this table does not know is passed on as it is, and the host's
+// kernel says what it makes of it.
+let sockopt_level = fn lv ->
+  if host_is_linux then lv else if lv == 1 then 65535 else lv;
+let sockopt_name = fn lv -> fn nm ->
+  if host_is_linux then nm
+  else if lv == 1 then
+    (if nm == 2 then 4 else if nm == 3 then 4104 else if nm == 4 then 4103
+     else if nm == 5 then 16 else if nm == 6 then 32 else if nm == 7 then 4097
+     else if nm == 8 then 4098 else if nm == 9 then 8 else if nm == 10 then 256
+     else if nm == 13 then 128 else if nm == 15 then 512 else if nm == 18 then 4100
+     else if nm == 19 then 4099 else if nm == 20 then 4102 else if nm == 21 then 4101
+     else if nm == 30 then 2 else nm)
+  else if lv == 0 then
+    (if nm == 1 then 3 else if nm == 2 then 4 else if nm == 3 then 2 else if nm == 4 then 1
+     else if nm == 32 then 9 else if nm == 33 then 10 else if nm == 34 then 11
+     else if nm == 35 then 12 else if nm == 36 then 13 else nm)
+  else if lv == 6 then
+    (if nm == 4 then 16 else if nm == 5 then 257 else if nm == 6 then 258 else nm)
+  else if lv == 41 then
+    (if nm == 26 then 27 else if nm == 16 then 4 else if nm == 17 then 9
+     else if nm == 18 then 10 else if nm == 19 then 11 else nm)
+  else nm;
 let host_put_str = fn mem -> fn at -> fn cap -> fn s ->
   let n = if str_len s < cap then str_len s else cap in
   let rec copy = fn i -> if i >= n then () else let _ = stb mem (at + i) (ord (char_at s i)) in copy (i + 1) in
@@ -554,6 +583,13 @@ let host_call = fn mem -> fn k -> fn a -> fn b -> fn c ->
   else if k == 1043 then sys_syslog a (cstr_at mem b)
   else if k == 1044 then sys_closelog ()
   else if k == 1045 then sys_setlogmask a
+  // the fd, the name and the level in one word: fd + name * 2^16 + level * 2^24
+  else if k == 1046 then
+    (let fd = a % 65536 in let nm = (a / 65536) % 256 in let lv = a / 16777216 in
+     host_put_str mem b c (sock_getopt fd (sockopt_level lv) (sockopt_name lv nm)))
+  else if k == 1047 then
+    (let fd = a % 65536 in let nm = (a / 65536) % 256 in let lv = a / 16777216 in
+     sock_setopt fd (sockopt_level lv) (sockopt_name lv nm) (cstr_at mem b))
   else if k == 1098 then lin_errno (fd_last_errno ())
   else if k == 1099 then lin_errno (proc_last_errno ())
   else 0 - 38;                                                          // -ENOSYS
