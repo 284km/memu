@@ -252,6 +252,11 @@ extern fn sock_pair: int -> int;
 // Mere v0.1.676: bind(2) / connect(2) to a path (struct sockaddr_un)
 extern fn sock_unix_bind: int -> str -> int;
 extern fn sock_unix_connect: int -> str -> int;
+// Mere v0.1.677: the system log
+extern fn sys_openlog: str -> int -> int -> int;
+extern fn sys_syslog: int -> str -> int;
+extern fn sys_closelog: unit -> int;
+extern fn sys_setlogmask: int -> int;
 extern fn udp_open: str -> int -> int;
 extern fn udp_send: int -> int -> int -> int;
 extern fn udp_recv: int -> int -> int -> int;
@@ -545,6 +550,10 @@ let host_call = fn mem -> fn k -> fn a -> fn b -> fn c ->
   else if k == 1039 then proc_wait_status ()
   else if k == 1040 then sock_unix_bind a (cstr_at mem b)
   else if k == 1041 then sock_unix_connect a (cstr_at mem b)
+  else if k == 1042 then sys_openlog (cstr_at mem a) b c
+  else if k == 1043 then sys_syslog a (cstr_at mem b)
+  else if k == 1044 then sys_closelog ()
+  else if k == 1045 then sys_setlogmask a
   else if k == 1098 then lin_errno (fd_last_errno ())
   else if k == 1099 then lin_errno (proc_last_errno ())
   else 0 - 38;                                                          // -ENOSYS
