@@ -249,6 +249,9 @@ extern fn sock_bind: int -> str -> int -> int;
 extern fn sock_local_addr: int -> str;
 extern fn sock_peer_addr: int -> str;
 extern fn sock_pair: int -> int;
+// Mere v0.1.676: bind(2) / connect(2) to a path (struct sockaddr_un)
+extern fn sock_unix_bind: int -> str -> int;
+extern fn sock_unix_connect: int -> str -> int;
 extern fn udp_open: str -> int -> int;
 extern fn udp_send: int -> int -> int -> int;
 extern fn udp_recv: int -> int -> int -> int;
@@ -540,6 +543,8 @@ let host_call = fn mem -> fn k -> fn a -> fn b -> fn c ->
   // a register is 32 bits here: -1 (no group change, any child) is 2^32 - 1
   else if k == 1038 then proc_waitpid (signed32 a) (signed32 b)
   else if k == 1039 then proc_wait_status ()
+  else if k == 1040 then sock_unix_bind a (cstr_at mem b)
+  else if k == 1041 then sock_unix_connect a (cstr_at mem b)
   else if k == 1098 then lin_errno (fd_last_errno ())
   else if k == 1099 then lin_errno (proc_last_errno ())
   else 0 - 38;                                                          // -ENOSYS
